@@ -139,6 +139,33 @@ def run_quality_gate(
         else f"{len(ohlc_bad)} symbols violate OHLC ordering: {ohlc_bad[:5]}",
     ))
 
+    # --- no unadjusted corporate actions remain ---------------------------
+    # Structural OHLC checks cannot see this: a demerger bar is internally
+    # consistent (high >= close >= low) and merely describes a different
+    # company. Only the RETURN reveals it. CGPOWER fell 155.30 -> 53.05 on
+    # 2016-03-15 and passed every other check in this gate.
+    #
+    # This matters disproportionately because Isolation Forest is unsupervised.
+    # A -66% day inside the training window becomes the most extreme point in
+    # the sample and drags the anomaly boundary towards it, making real crashes
+    # look ordinary by comparison.
+    extreme = {}
+    for sym, frame in frames.items():
+        if len(frame) < 2:
+            continue
+        log_ret = np.log(frame["close"] / frame["close"].shift(1))
+        hits = log_ret[log_ret.abs() > dcfg.max_abs_log_return]
+        if len(hits):
+            worst = hits.abs().idxmax()
+            extreme[sym] = f"{worst.date()} {np.expm1(hits.loc[worst]) * 100:+.1f}%"
+    add(QualityCheck(
+        "no_unadjusted_corporate_actions", not extreme, ERROR,
+        f"no daily move exceeds +/-{dcfg.max_abs_log_return:.2f} log return"
+        if not extreme
+        else f"{len(extreme)} symbols contain suspected corporate actions: "
+             f"{dict(list(extreme.items())[:5])}",
+    ))
+
     # --- end-date alignment -----------------------------------------------
     ends = pd.Series({s: f.index[-1] for s, f in frames.items() if not f.empty})
     span_days = (ends.max() - ends.min()).days if len(ends) else 0

@@ -3,8 +3,8 @@ loader.py
 ---------
 Raw CSV -> trustworthy per-symbol price frame.
 
-What it does:   Loads one symbol, repairs the five defects found in the Phase 0
-                audit, and returns a frame whose every row can be believed.
+What it does:   Loads one symbol, repairs the six known data defects, and
+                returns a frame whose every row can be believed.
 Why we do it:   The raw files contain fabricated pre-IPO history, a fake
                 adjusted-close column, zero-range bars, and ragged end dates.
                 None of these announce themselves -- they silently produce
@@ -13,8 +13,8 @@ How (method):   Each defect gets one explicit, tested rule. Nothing is repaired
                 by inference or by filling.
 Where:          loader.py -> load_symbol(), load_universe()
 
-THE FIVE DEFECTS (measured, Phase 0)
-------------------------------------
+THE SIX DEFECTS (measured)
+--------------------------
 1. `adj_close` is not an adjusted series. It differs from `close` on ~30 of
    ~5,800 bars per symbol; a real adjustment factor differs on EVERY bar before
    the last corporate action. `close` is already back-adjusted, so we use it
@@ -32,6 +32,13 @@ THE FIVE DEFECTS (measured, Phase 0)
    hard_end so the cross-section stays square.
 
 5. Non-positive and duplicate-date rows. Removed with a warning.
+
+6. Unadjusted corporate actions. `close` is back-adjusted for splits and
+   bonuses but NOT for demergers. CGPOWER falls 155.30 -> 53.05 on 2016-03-15
+   (Crompton Greaves Consumer demerger) and ADANIENT falls 78% on 2015-06-04
+   (Adani Ports/Transmission/Power spin-off). Both are internally consistent
+   bars that pass every structural check -- only the RETURN betrays them.
+   Found in Phase 1 testing, after the original audit.
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ class SymbolReport:
     first_valid: pd.Timestamp | None
     truncated_rows: int          # fabricated pre-IPO bars removed
     n_gaps: int                  # calendar gaps that triggered truncation
+    n_corp_actions: int          # unadjusted corporate-action breaks found
     flat_bars: int
     zero_volume: int
     dropped_bad_price: int
@@ -80,6 +88,44 @@ def list_symbols(include_index: bool = False) -> list[str]:
     if not include_index:
         names = [n for n in names if n != INDEX_SYMBOL]
     return names
+
+
+def _find_corporate_action_break(
+    close: pd.Series,
+    max_abs_log_return: float,
+) -> tuple[pd.Timestamp | None, int]:
+    """
+    Locate unadjusted corporate actions (demergers, spin-offs, missed splits).
+
+    The `close` series is back-adjusted for splits and bonuses but NOT for
+    capital restructurings. CGPOWER falls from 155.30 to 53.05 on 2016-03-15
+    and stays there -- the Crompton Greaves Consumer demerger. No shareholder
+    lost 66%; they received shares in the demerged entity. The return is an
+    artefact of the price series, not an event in the market.
+
+    This matters more than its rarity suggests. Isolation Forest is
+    unsupervised: it learns "normal" from whatever it is shown. A -66% day
+    inside the training window becomes the most extreme point in the sample and
+    drags the anomaly boundary out towards it, making genuine crashes look
+    comparatively ordinary. One bad bar degrades every score that follows.
+
+    Handled the same way as fabricated pre-listing history: everything before
+    the break is a different security and is discarded. We deliberately do not
+    try to re-adjust prior prices -- the correct factor depends on the demerger
+    ratio, which is not in this data, and inferring it from the price jump
+    would assume exactly what we are trying to detect.
+
+    Returns (first_valid_date, n_breaks). None if the series is clean.
+    """
+    if len(close) < 2:
+        return None, 0
+
+    log_ret = np.log(close / close.shift(1))
+    breaks = np.flatnonzero(log_ret.abs().to_numpy() > max_abs_log_return)
+    if breaks.size == 0:
+        return None, 0
+    # The bar AT the last break is the first of the restructured security.
+    return close.index[breaks[-1]], int(breaks.size)
 
 
 def _find_first_valid_bar(dates: pd.DatetimeIndex, max_gap_days: int) -> tuple[pd.Timestamp, int]:
@@ -150,7 +196,7 @@ def load_symbol(
 
     if raw.empty:
         return _empty_frame(), SymbolReport(
-            symbol, raw_rows, 0, None, 0, 0, 0, 0,
+            symbol, raw_rows, 0, None, 0, 0, 0, 0, 0,
             dropped_bad_price, dropped_duplicates, False, "no valid price rows",
         )
 
@@ -158,6 +204,16 @@ def load_symbol(
 
     # --- defect 2: fabricated pre-IPO history -------------------------------
     first_valid, n_gaps = _find_first_valid_bar(raw.index, dcfg.max_gap_days)
+
+    # --- defect 6: unadjusted corporate actions -----------------------------
+    # Whichever break is later bounds the usable history: a symbol can have
+    # both stitched pre-listing bars and a later restructuring.
+    ca_date, n_breaks = _find_corporate_action_break(
+        raw["close"], dcfg.max_abs_log_return
+    )
+    if ca_date is not None and ca_date > first_valid:
+        first_valid = ca_date
+
     truncated_rows = int((raw.index < first_valid).sum())
     raw = raw.loc[raw.index >= first_valid]
 
@@ -188,6 +244,7 @@ def load_symbol(
         first_valid=first_valid,
         truncated_rows=truncated_rows,
         n_gaps=n_gaps,
+        n_corp_actions=n_breaks,
         flat_bars=int(out["is_flat"].sum()),
         zero_volume=int(out["is_zero_vol"].sum()),
         dropped_bad_price=dropped_bad_price,
@@ -199,9 +256,14 @@ def load_symbol(
     if strict and not usable:
         raise ValueError(f"{symbol}: {reason}")
     if truncated_rows:
+        cause = (
+            f"unadjusted corporate action on {ca_date.date()}"
+            if ca_date is not None and ca_date == first_valid
+            else f"{n_gaps} calendar gaps"
+        )
         warnings.warn(
-            f"{symbol}: dropped {truncated_rows} fabricated pre-listing bars "
-            f"before {first_valid.date()} ({n_gaps} calendar gaps found)",
+            f"{symbol}: dropped {truncated_rows} bars before "
+            f"{first_valid.date()} ({cause})",
             stacklevel=2,
         )
     return out, report

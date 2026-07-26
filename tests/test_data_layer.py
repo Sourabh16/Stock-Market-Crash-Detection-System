@@ -118,6 +118,68 @@ def test_dropping_rows_would_corrupt_windows(universe):
 
 
 # =====================================================================
+# Defect 6 -- unadjusted corporate actions
+# =====================================================================
+#: Real restructurings where `close` was never adjusted. Externally sourced.
+KNOWN_CORPORATE_ACTIONS = {
+    "CGPOWER": dt.date(2016, 3, 15),    # Crompton Greaves Consumer demerger
+    "ADANIENT": dt.date(2015, 6, 4),    # Adani Ports/Transmission/Power spin-off
+}
+
+
+@pytest.mark.parametrize("symbol,action_date", KNOWN_CORPORATE_ACTIONS.items())
+def test_corporate_action_truncates_history(symbol, action_date):
+    """History before a demerger belongs to a different company."""
+    frame, report = load_symbol(symbol)
+    assert report.n_corp_actions >= 1
+    assert frame.index[0].date() == action_date
+    assert report.truncated_rows > 0
+
+
+def test_real_crashes_are_not_mistaken_for_corporate_actions():
+    """
+    The threshold must separate artefacts from genuine market events.
+
+    ADANIENT fell 26.1% on the Hindenburg report and TRENT 31.9% in June 2026.
+    Both are real and must survive; a blanket outlier filter would delete the
+    very events this project exists to detect.
+    """
+    frame, report = load_symbol("TRENT")
+    assert report.n_corp_actions == 0
+    assert frame.index[0].year <= 2003
+
+    adani, _ = load_symbol("ADANIENT")
+    hindenburg = adani["close"].pct_change().loc["2023-02-03"]
+    assert -0.30 < hindenburg < -0.20, "the Hindenburg crash must remain in the data"
+
+
+def test_no_extreme_returns_survive(universe):
+    """After cleaning, no symbol should contain an implausible daily move."""
+    limit = DEFAULT_CONFIG.data.max_abs_log_return
+    for sym, frame in universe[0].items():
+        log_ret = np.log(frame["close"] / frame["close"].shift(1))
+        worst = log_ret.abs().max()
+        assert worst <= limit, f"{sym} retains a {np.expm1(worst) * 100:.1f}% move"
+
+
+def test_gate_catches_an_injected_corporate_action(universe, calendar):
+    """
+    A demerger bar passes every structural check -- only the return reveals it.
+
+    This is the regression guard for the defect found during Phase 1 testing.
+    """
+    frames, reports = universe
+    poisoned = dict(frames)
+    frame = poisoned["RELIANCE"].copy()
+    frame.iloc[-50:, frame.columns.get_indexer(["open", "high", "low", "close"])] *= 0.3
+    poisoned["RELIANCE"] = frame
+
+    report = run_quality_gate(poisoned, reports, calendar, raise_on_error=False)
+    assert not report.ok
+    assert any(c.name == "no_unadjusted_corporate_actions" for c in report.failed_errors)
+
+
+# =====================================================================
 # Defect 4 -- ragged end dates
 # =====================================================================
 def test_end_dates_are_trimmed(universe):

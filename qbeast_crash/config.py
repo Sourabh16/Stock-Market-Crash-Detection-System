@@ -46,6 +46,20 @@ class DataConfig:
     #: volatility warmup plus any meaningful backtest.
     min_bars: int = 300
 
+    #: A one-day LOG return beyond this is treated as an unadjusted corporate
+    #: action (demerger, spin-off, unadjusted split), not a market move.
+    #:
+    #: 0.50 in log terms is roughly -39% / +65% simple. The margin is chosen so
+    #: real crashes survive and artefacts do not:
+    #:
+    #:    CGPOWER  2016-03-15   log -1.074  (-65.8%)  demerger    -> caught
+    #:    TRENT    2026-06-02   log -0.384  (-31.9%)  market      -> kept
+    #:    ADANIENT 2023-02-03   log -0.302  (-26.1%)  Hindenburg  -> kept
+    #:
+    #: Indian large caps do genuinely fall 20-30% in a day. They do not fall
+    #: 66% and stay there, which is the signature of a capital restructuring.
+    max_abs_log_return: float = 0.50
+
     #: Ragged vendor end-dates. 98 of 100 symbols have data through this date;
     #: trimming here keeps the cross-section square, which the market-wide
     #: breadth signal depends on.
