@@ -399,6 +399,16 @@ class SignalConfig:
     #: the entire advantage. Whipsaw is controlled by the cooldown instead.
     exit_persistence: int = 1
 
+    #: A MILD anomaly opens a watch instead of acting. Anything at or above
+    #: this and below exit_intensity is mild.
+    moderate_intensity: float = 0.95
+
+    #: How many sessions a mild-anomaly watch stays open. Five is the brief's
+    #: figure and is about right: most declines that are going to accelerate do
+    #: so within a week, and a longer watch mostly collects days on which
+    #: nothing happened.
+    watch_days: int = 5
+
     reentry_intensity: float = 0.95
 
     #: Minimum sessions held before an exit may fire.

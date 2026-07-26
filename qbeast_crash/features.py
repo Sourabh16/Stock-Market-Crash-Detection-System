@@ -527,6 +527,10 @@ def compute_precursors(
     out["slope_z"] = sa["slope_z"]
     out["accel_z"] = sa["accel_z"]
     out["phase"] = sa["phase"]
+    # Carried through so the mild-anomaly watch can put a single day's return
+    # on the SAME scale as slope_z. Comparing a raw % move against a
+    # sigma-normalised slope would compare two different units.
+    out["vol"] = sa["vol"]
 
     # Infinities can arise from near-zero denominators surviving the guards.
     # They must not reach the model: a single inf makes every finite value look

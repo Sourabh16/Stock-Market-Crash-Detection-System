@@ -10,10 +10,13 @@ backtest would complain -- it would just report a better number.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from qbeast_crash.config import DEFAULT_CONFIG
 from qbeast_crash.signals import (
     ReentryRule,
     SignalConfig,
@@ -244,3 +247,103 @@ def test_performance_computes_cagr_and_drawdown():
 def test_performance_handles_empty_input():
     stats = performance(pd.Series(dtype=float), years=1.0)
     assert np.isnan(stats["cagr"]) and np.isnan(stats["max_drawdown"])
+
+
+# =====================================================================
+# The two-tier logic: severe acts immediately, mild opens a watch
+# =====================================================================
+def _watch_frame(n=200, intensity=0.5, phase="Flat", slope=0.0, ret=0.0, regime="Sideways"):
+    idx = pd.bdate_range("2021-01-04", periods=n)
+    return pd.DataFrame({
+        "intensity": np.full(n, intensity),
+        "phase": np.array([phase] * n, dtype=object),
+        "slope_z": np.full(n, slope),
+        "ret_1d": np.full(n, ret),
+        "vol": np.ones(n),
+        "regime": np.array([regime] * n, dtype=object),
+    }, index=idx)
+
+
+def test_severe_anomaly_acts_the_next_day_without_waiting():
+    """
+    The edge is concentrated at a one-day horizon and decays fast, so a severe
+    anomaly must not wait for confirmation.
+    """
+    f = _watch_frame()
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.999
+    f.iloc[50, f.columns.get_loc("phase")] = "AcceleratingDecline"
+
+    sig = generate_signals(f)
+    assert sig["action"].iloc[50] == "EXIT"
+    assert sig["in_position"].iloc[50]          # still held ON the signal day
+    assert not sig["in_position"].iloc[51]      # out from the next day
+
+
+def test_mild_anomaly_opens_a_watch_instead_of_selling():
+    f = _watch_frame(slope=-0.5, regime="Sideways")
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96      # mild
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+
+    sig = generate_signals(f)
+    assert sig["watching"].iloc[51:55].any(), "a watch should be open"
+    assert (sig["action"] == "EXIT").sum() == 0, "a mild anomaly must not sell outright"
+
+
+def test_watch_sells_when_the_fall_accelerates_and_regime_confirms():
+    """
+    Inside the watch: today's move worse than the 5-day slope means the decline
+    is steepening. With the regime confirming, sell without waiting out the
+    remaining days.
+    """
+    f = _watch_frame(slope=-0.5, ret=0.0, regime="Crashing")
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+    # day 52: a sharp down day, worse than the prevailing 5-day slope
+    f.iloc[52, f.columns.get_loc("ret_1d")] = -3.0
+
+    sig = generate_signals(f)
+    exits = np.flatnonzero((sig["action"] == "EXIT_WATCH").to_numpy())
+    assert exits.size >= 1
+    assert 50 <= exits[0] <= 55, "should sell inside the watch window"
+
+
+def test_watch_stands_down_if_the_stock_turns_up():
+    f = _watch_frame(slope=-0.5, regime="Crashing")
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+    f.iloc[51:, f.columns.get_loc("slope_z")] = +0.8        # recovers
+
+    sig = generate_signals(f)
+    assert (sig["action"] == "EXIT_WATCH").sum() == 0
+    assert sig["in_position"].all()
+
+
+def test_watch_expires_after_watch_days():
+    """A watch that resolves into nothing must close, not linger."""
+    f = _watch_frame(slope=-0.2, regime="Sideways")
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+
+    cfg = dataclasses.replace(DEFAULT_CONFIG.signals, watch_days=5)
+    sig = generate_signals(f, cfg)
+    assert not sig["watching"].iloc[60:].any(), "watch should have expired"
+
+
+def test_regime_can_veto_a_watch_exit():
+    """The backdrop check is a real gate, not decoration."""
+    f = _watch_frame(slope=-0.5, regime="Rally")       # regime disagrees
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+    f.iloc[52, f.columns.get_loc("ret_1d")] = -3.0
+
+    assert (generate_signals(f)["action"] == "EXIT_WATCH").sum() == 0
+
+
+def test_mild_path_still_works_without_a_regime_column():
+    """Older frames have no regime; the check must pass rather than crash."""
+    f = _watch_frame(slope=-0.5).drop(columns=["regime"])
+    f.iloc[50, f.columns.get_loc("intensity")] = 0.96
+    f.iloc[50, f.columns.get_loc("phase")] = "DeceleratingDecline"
+    f.iloc[52, f.columns.get_loc("ret_1d")] = -3.0
+    sig = generate_signals(f)
+    assert (sig["action"] == "EXIT_WATCH").sum() >= 1

@@ -32,6 +32,7 @@ import pandas as pd
 
 from qbeast_crash.config import (
     DATA_INTERIM,
+    DATA_RAW,
     DATA_PROCESSED,
     DEFAULT_CONFIG,
     MODELS,
@@ -56,6 +57,7 @@ from qbeast_crash.plots import (
     plot_scheme_comparison,
     plot_symbol,
 )
+from qbeast_crash.regime import detect_regimes, realized_hv
 from qbeast_crash.retrain import SCHEMES, SchemeResult, walk_forward
 from qbeast_crash.signals import (
     ReentryRule,
@@ -213,8 +215,22 @@ def phase_3(ctx: dict) -> dict:
         band=detector.band(intensity),
     )
 
+    # The mild-anomaly watch checks the regime before selling, so it has to be
+    # on the frame. Computed per symbol and causally -- percentile thresholds
+    # come from a trailing window, never the full series.
+    regimes = {}
+    for sym, frame in ctx["frames"].items():
+        close = frame["close"].astype(float)
+        mkt, _ = detect_regimes(close.to_numpy(), realized_hv(close.to_numpy()),
+                                index=frame.index)
+        regimes[sym] = pd.Series(mkt, index=frame.index)
+    regime_long = pd.concat(regimes, names=["symbol", "date"]).reorder_levels(
+        ["date", "symbol"]).sort_index()
+    scored = scored.assign(regime=regime_long.reindex(scored.index))
+
     detector.save(MODELS / "detector_baseline.pkl")
-    scored[["intensity", "band", "slope_z", "accel_z", "phase"]].to_parquet(
+    scored[["intensity", "band", "slope_z", "accel_z", "phase", "regime",
+            "ret_1d", "vol"]].to_parquet(
         DATA_PROCESSED / "intensity.parquet"
     )
 
@@ -934,22 +950,42 @@ def main() -> int:
     ap.add_argument("--phase", type=int, help="run one phase only")
     ap.add_argument("--from", dest="start", type=int, help="run from this phase onward")
     ap.add_argument("--list", action="store_true", help="list phases and exit")
-    ap.add_argument("--dev", action="store_true",
-                    help="run on the 10-symbol dev universe (seconds, not minutes)")
     ap.add_argument("--symbols", type=str,
-                    help="comma-separated symbols, e.g. RELIANCE,TCS,ITC")
+                    help="comma-separated symbols to train and trade, "
+                         "e.g. RELIANCE,TCS,ITC")
+    ap.add_argument("--all", action="store_true",
+                    help="use every symbol in data/raw (96)")
     args = ap.parse_args()
 
     global UNIVERSE
     if args.symbols:
         UNIVERSE = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    elif args.dev:
-        UNIVERSE = list(CFG.data.dev_universe)
+    elif args.all:
+        UNIVERSE = None
+    else:
+        # No default universe. Picking one silently would mean every result
+        # depends on a choice the user never made, and a subset that happens to
+        # contain one big crash can carry an entire portfolio result.
+        available = sorted(p.stem for p in DATA_RAW.glob("*.csv") if p.stem != "NIFTY100")
+        print("Which symbols should the model train and trade on?\n")
+        print("  python scripts/run_all_phases.py --symbols RELIANCE,TCS,ITC")
+        print("  python scripts/run_all_phases.py --all        # all 96\n")
+        print(f"{len(available)} available in data/raw:\n")
+        for i in range(0, len(available), 8):
+            print("  " + "  ".join(f"{x:<13s}" for x in available[i:i + 8]))
+        return 2
+
     if UNIVERSE is not None:
-        print(f"universe restricted to {len(UNIVERSE)} symbols: {', '.join(UNIVERSE)}")
+        missing = [s for s in UNIVERSE if not (DATA_RAW / f"{s}.csv").exists()]
+        if missing:
+            print(f"no CSV found for: {', '.join(missing)}")
+            print(f"look in {DATA_RAW}")
+            return 2
+        print(f"training and trading {len(UNIVERSE)} symbols: {', '.join(UNIVERSE)}")
         if len(UNIVERSE) < 20:
-            print("NOTE: cross-sectional features (breadth, correlation) are noisy on a\n"
-                  "      small universe. Confirm market-wide results on the full set.")
+            print("\nNote on small universes: breadth and correlation are measured\n"
+                  "across your chosen symbols, so with fewer than ~20 they are noisy.\n"
+                  "One stock's crash can also dominate the whole portfolio result.")
 
     if args.list:
         for n, (name, _) in sorted(PHASES.items()):

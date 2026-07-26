@@ -109,24 +109,54 @@ def generate_signals(
     reentry: str = ReentryRule.NOT_DECLINING,
 ) -> pd.DataFrame:
     """
-    Run the hold/cash state machine for one symbol.
+    Decide, for each day, whether to hold the stock or sit in cash.
+
+    TWO WAYS A SIGNAL CAN FIRE
+    --------------------------
+    An anomaly score is computed every day. What happens next depends on how
+    severe it is.
+
+    SEVERE anomaly (intensity >= exit_intensity, default 0.99)
+        Check today's slope and acceleration. If the stock is falling AND the
+        fall is speeding up, act on the NEXT trading day. No waiting -- the
+        edge is concentrated at a one-day horizon and decays fast, so a
+        confirmation delay spends most of it.
+
+    MILD anomaly (moderate_intensity <= intensity < exit_intensity)
+        Do not act. Open a WATCH lasting up to watch_days sessions. On each
+        day of the watch, compare the 1-day move against the 5-day slope and
+        check the regime:
+
+            1-day move worse than the 5-day slope  ->  the fall is
+                                                       accelerating
+            regime is Crashing or Falling          ->  the backdrop confirms
+
+        If both agree, sell immediately rather than waiting out the watch.
+        If the stock turns up instead, close the watch and do nothing.
+
+    The mild path exists because most declines do not announce themselves with
+    one dramatic day. They start as an ordinary-looking wobble that only
+    becomes obviously bad several days in, by which point a severe-only rule
+    has already missed most of the fall.
 
     Parameters
     ----------
-    frame : per-symbol frame indexed by date, with `intensity` and `phase`.
+    frame : per-symbol frame indexed by date. Needs `intensity` and `phase`;
+            uses `ret_1d`, `slope_z` and `regime` when present.
 
     Returns
     -------
     DataFrame with:
-        exit_signal   the exit condition fired on this bar
-        reentry_ok    the re-entry condition was satisfied on this bar
-        in_position   whether the stock is HELD on this bar
-        action        "EXIT", "ENTER", or "" on the bar the decision was taken
+        exit_signal   the severe exit condition fired today
+        watching      a mild-anomaly watch was open today
+        reentry_ok    the re-entry condition was satisfied today
+        in_position   whether the stock is HELD today
+        action        "EXIT", "EXIT_WATCH", "ENTER", or "" on the decision day
 
-    CAUSALITY. A decision taken on bar t applies from bar t+1. The signal is
-    computed at the close, so acting on the same bar's close would require a
-    time machine. `in_position` therefore reflects the state you would actually
-    have been in, and returns should be applied to it directly.
+    CAUSALITY. A decision taken on day t applies from day t+1. The signal is
+    computed at the close, so acting on that same close would require a time
+    machine. `in_position` already reflects that, so returns can be applied to
+    it directly.
     """
     cfg = config or DEFAULT_CONFIG.signals
     n = len(frame)
@@ -134,36 +164,75 @@ def generate_signals(
     intensity = frame["intensity"].to_numpy()
     phase = frame["phase"].to_numpy()
 
-    exit_cond = (intensity >= cfg.exit_intensity) & (phase == "AcceleratingDecline")
-
-    # Require N consecutive confirming days.
+    # ---- severe: act next day on slope + acceleration -------------------
+    severe = (intensity >= cfg.exit_intensity) & (phase == "AcceleratingDecline")
     if cfg.exit_persistence > 1:
-        series = pd.Series(exit_cond)
-        exit_cond = (
-            series.rolling(cfg.exit_persistence, min_periods=cfg.exit_persistence)
-            .sum()
-            .fillna(0)
-            .to_numpy()
-            >= cfg.exit_persistence
+        severe = (
+            pd.Series(severe)
+            .rolling(cfg.exit_persistence, min_periods=cfg.exit_persistence)
+            .sum().fillna(0).to_numpy() >= cfg.exit_persistence
         )
+
+    # ---- mild: open a watch ---------------------------------------------
+    mild = (intensity >= cfg.moderate_intensity) & (intensity < cfg.exit_intensity) \
+        & (phase.astype(str) != "AcceleratingAdvance")
+
+    # Today's move against the 5-day trend. Both are already in daily sigmas,
+    # so the comparison is like-for-like across stocks. Today being worse than
+    # the trend means the decline is steepening.
+    ret_1d = frame["ret_1d"].to_numpy() if "ret_1d" in frame else np.zeros(n)
+    slope_z = frame["slope_z"].to_numpy() if "slope_z" in frame else np.zeros(n)
+    vol = frame["vol"].to_numpy() if "vol" in frame else np.ones(n)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret_z = np.where(np.isfinite(vol) & (vol > 1e-12), ret_1d / vol, 0.0)
+    accelerating_down = np.nan_to_num(ret_z) < np.nan_to_num(slope_z)
+
+    regime = (frame["regime"].to_numpy() if "regime" in frame
+              else np.array(["Unknown"] * n, dtype=object))
+    regime_bad = np.isin(regime, ("Crashing", "Falling"))
+    # With no regime column the backdrop check cannot veto, so it passes.
+    if "regime" not in frame:
+        regime_bad = np.ones(n, dtype=bool)
+
+    falling = np.nan_to_num(slope_z) < 0
+    watch_confirms = accelerating_down & regime_bad & falling
 
     reentry_cond = _reentry_mask(frame, reentry, cfg)
 
-    in_position = np.ones(n, dtype=bool)      # long is the default state
+    in_position = np.ones(n, dtype=bool)
+    watching = np.zeros(n, dtype=bool)
     action = np.array([""] * n, dtype=object)
 
     holding = True
-    since_change = 10_000                     # large, so nothing is blocked at the start
+    since_change = 10_000
+    watch_left = 0
 
     for t in range(n):
         in_position[t] = holding
+        watching[t] = watch_left > 0
         since_change += 1
 
         if holding:
-            if exit_cond[t] and since_change > cfg.min_hold:
+            if severe[t] and since_change > cfg.min_hold:
                 holding = False
                 since_change = 0
+                watch_left = 0
                 action[t] = "EXIT"
+
+            elif watch_left > 0:
+                if watch_confirms[t] and since_change > cfg.min_hold:
+                    holding = False
+                    since_change = 0
+                    watch_left = 0
+                    action[t] = "EXIT_WATCH"
+                elif np.nan_to_num(slope_z[t]) > 0:
+                    watch_left = 0          # it turned up; stand down
+                else:
+                    watch_left -= 1
+
+            elif mild[t]:
+                watch_left = cfg.watch_days
+
         else:
             forced = since_change >= cfg.max_cash_days
             if since_change > cfg.cooldown and (reentry_cond[t] or forced):
@@ -171,15 +240,15 @@ def generate_signals(
                 since_change = 0
                 action[t] = "ENTER"
 
-    # T+1 execution is already baked into the loop: in_position[t] is assigned
-    # BEFORE the decision at t is processed, so an exit signalled on bar t
-    # leaves in_position[t] True and in_position[t+1] False. Applying a further
-    # .shift(1) here would delay every trade by a second day -- a bug that a
-    # backtest would never complain about, it would just quietly report worse
-    # numbers. Caught by test_exit_takes_effect_the_day_after_the_signal.
+    # T+1 execution is already baked in: in_position[t] is assigned BEFORE the
+    # decision at t is processed, so an exit signalled on day t leaves
+    # in_position[t] True and in_position[t+1] False. A further .shift(1) here
+    # would delay every trade by a second day -- a bug a backtest would never
+    # complain about, it would just report worse numbers forever.
     return pd.DataFrame(
         {
-            "exit_signal": exit_cond,
+            "exit_signal": severe,
+            "watching": watching,
             "reentry_ok": reentry_cond,
             "in_position": in_position,
             "action": action,
