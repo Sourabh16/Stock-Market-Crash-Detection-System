@@ -229,3 +229,55 @@ def test_missing_prices_are_skipped_not_treated_as_zero():
     res = run_backtest(p, pos, 1_000_000.0)
     assert np.isfinite(res["equity"]).all()
     assert (res["equity"] > 0).all()
+
+
+# =====================================================================
+# Regression guards from the Phase 6 recheck
+# =====================================================================
+def test_missing_price_does_not_invent_a_drawdown():
+    """
+    A silent tape is not a worthless holding.
+
+    Valuing an open position at zero when the price is missing prints a fake
+    crash on the day of the gap and a fake recovery the day after -- and a fake
+    crash is precisely what a drawdown study must never invent. It would also
+    look like a result rather than an error.
+    """
+    idx = pd.bdate_range("2021-01-04", periods=200)
+    p = pd.DataFrame({"A": np.full(200, 100.0), "B": np.full(200, 100.0)}, index=idx)
+    p.iloc[100:105, 0] = np.nan
+    pos = pd.DataFrame(True, index=idx, columns=p.columns)
+
+    eq = run_backtest(p, pos, 1_000_000.0)["equity"]
+    assert (eq / eq.cummax() - 1).min() > -0.01
+    assert eq.iloc[102] == pytest.approx(eq.iloc[99])
+
+
+def test_stale_prices_are_used_for_valuation_but_never_for_trading():
+    """You cannot fill at a price the market never printed."""
+    idx = pd.bdate_range("2021-01-04", periods=100)
+    p = pd.DataFrame({"A": np.full(100, 100.0)}, index=idx)
+    p.iloc[50:60, 0] = np.nan
+
+    pos = pd.DataFrame(True, index=idx, columns=p.columns)
+    pos.iloc[50:60] = False                      # asked to exit during the gap
+
+    res = run_backtest(p, pos, 1_000_000.0)
+    sells = res["trades"][res["trades"]["side"] == "sell"]
+    assert sells.empty or (sells["date"] >= idx[60]).all()
+
+
+def test_final_year_tax_is_charged_even_if_due_after_the_window():
+    """
+    Otherwise equity_after_tax silently disagrees with total_tax: the summary
+    reports a liability the equity curve never pays.
+    """
+    idx = pd.bdate_range("2025-04-01", periods=120)     # FY 2025, ends mid-year
+    p = pd.DataFrame({"A": np.linspace(100.0, 200.0, 120)}, index=idx)
+    pos = pd.DataFrame(True, index=idx, columns=p.columns)
+    pos.iloc[60:] = False                                # realise a gain
+
+    res = run_backtest(p, pos, 1_000_000.0)
+    if res["total_tax"] > 0:
+        drop = res["equity"].iloc[-1] - res["equity_after_tax"].iloc[-1]
+        assert drop == pytest.approx(res["total_tax"], rel=1e-6)

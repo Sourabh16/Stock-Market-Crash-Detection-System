@@ -243,6 +243,7 @@ def run_backtest(
 
     cash = {s: sleeve_capital for s in symbols}
     lots: dict[str, list[Lot]] = {s: [] for s in symbols}
+    last_price: dict[str, float] = {}
     trades: list[dict] = []
     realised: list[dict] = []
     equity = np.zeros(len(dates))
@@ -295,10 +296,26 @@ def run_backtest(
                         trades.append({"date": date, "symbol": sym, "side": "buy",
                                        "qty": qty, "price": fill, **cost})
 
+        # Value open positions at the last KNOWN price, not at zero.
+        #
+        # A missing price means the tape is silent, not that the holding became
+        # worthless. Valuing it at zero would print a fake crash in the equity
+        # curve on the day of the gap and a fake recovery on the day after --
+        # and a fake crash is exactly the thing a drawdown study must not
+        # invent. Only 2 such cells exist in the current window, but the bug
+        # would be severe on data with more gaps, and it would look like a real
+        # result rather than an error.
+        #
+        # Stale prices are used for VALUATION only. Trading is skipped entirely
+        # when the price is missing, because you cannot fill at a price the
+        # market never printed.
+        for sym in symbols:
+            px = prices.iat[i, prices.columns.get_loc(sym)]
+            if np.isfinite(px) and px > 0:
+                last_price[sym] = px
+
         equity[i] = sum(cash.values()) + sum(
-            sum(lot.qty for lot in lots[s])
-            * (prices.iat[i, prices.columns.get_loc(s)]
-               if np.isfinite(prices.iat[i, prices.columns.get_loc(s)]) else 0.0)
+            sum(lot.qty for lot in lots[s]) * last_price.get(s, 0.0)
             for s in symbols
         )
 
@@ -366,10 +383,24 @@ def _apply_tax(equity: pd.Series, tax_table: pd.DataFrame) -> pd.Series:
         return out
 
     running = 0.0
+    unpaid = 0.0
     for _, row in tax_table.sort_values("fy").iterrows():
         pay_date = pd.Timestamp(dt.date(int(row["fy"]) + 1, 3, 31))
-        running += float(row["tax"])
+        amount = float(row["tax"])
+
+        if pay_date > equity.index[-1]:
+            # The bill for the final, partial financial year falls due after
+            # the backtest ends. Ignoring it would let equity_after_tax
+            # disagree with total_tax -- the summary would report a liability
+            # the curve never pays. It is charged at the last bar instead.
+            unpaid += amount
+            continue
+
+        running += amount
         out.loc[out.index >= pay_date] = equity.loc[out.index >= pay_date] - running
+
+    if unpaid:
+        out.iloc[-1] -= unpaid
     return out
 
 

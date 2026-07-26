@@ -1298,6 +1298,168 @@ const PHASES = {
       return c;
     },
   },
+
+  phase6: {
+    slug: "Phase6_Costs_and_Tax",
+    docTitle: "QBEAST Phase 6 - Backtest with Costs and Tax",
+    runningHead: "QBEAST \u00b7 Phase 6 - Costs and Tax",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 6",
+        title: "Costs & Tax",
+        subtitle: "What survives the NSE cost stack and Indian capital gains treatment",
+        status: "STATUS: COMPLETE - 151 tests passing",
+        meta: [
+          "Cost drag: 0.088% of capital per year",
+          "The tax hypothesis did not survive measurement",
+          "Two latent bugs found and fixed on recheck",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      // ------------------------------------------------------- 1
+      c.push(
+        H1("1. What this phase measures"),
+        P("A backtest without costs describes a market, not a strategy. But for this strategy specifically, the interesting cost was never expected to be brokerage. At 0.4 trades per symbol per year there is simply not enough turnover for friction to matter."),
+        P("The question worth asking was about tax, and the answer turned out to be different from the one anticipated."),
+
+        H2("1.1 The cost stack"),
+        Tbl(["Component", "Rate", "Applies to"], [
+          ["Brokerage", "0%", "Delivery at a discount broker"],
+          ["STT", "0.1%", "BOTH legs on delivery - the largest component"],
+          ["Exchange transaction", "0.00297%", "Both legs; revised 1 Oct 2024"],
+          ["SEBI turnover fee", "Rs 10 per crore", "Both legs"],
+          ["Stamp duty", "0.015%", "BUY side only"],
+          ["GST", "18%", "Brokerage + exchange + SEBI, not on taxes"],
+          ["DP charge", "Rs 15.34", "SELL side, per scrip per day"],
+          ["Slippage", "5bp, volatility-scaled", "Both legs"],
+        ], [2300, 1900, 4800]),
+        P("Measured round trip on a Rs 1,00,000 position: about 0.238%."),
+        Callout("The component most often modelled wrongly", [
+          "STT is charged on BOTH legs for delivery trades. Sell-side-only is INTRADAY.",
+          "Halving it by mistake makes every backtest look better, and nothing else in the output flags the error. It is the single largest line in the stack, so the mistake is worth roughly 0.1% per round trip.",
+        ], "warn"),
+
+        H2("1.2 Two things a static rate card gets wrong"),
+        P("Two rates moved INSIDE the backtest window, so a single fixed value would be wrong for roughly half the period:"),
+        ...Code([
+          "2024-07-23   STCG 15% -> 20%",
+          "             LTCG 10% -> 12.5%",
+          "             LTCG exemption Rs 1,00,000 -> Rs 1,25,000",
+          "",
+          "2024-10-01   NSE transaction charge 0.00325% -> 0.00297%",
+        ]),
+        P("Every rate is therefore a function of the trade date rather than a constant."),
+
+        H2("1.3 Why slippage is not flat"),
+        P("A constant slippage percentage is the wrong SHAPE for this strategy, not merely the wrong size. The strategy trades only on crash and rally days, which is precisely when spreads widen -- often three to five times. A flat figure is simultaneously too high on the quiet days it never trades and too low on the volatile days it always does, so slippage scales with the day's realised volatility."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 2
+      c.push(
+        H1("2. Portfolio construction"),
+        P("Capital is split equally across symbols at the start, and each symbol then keeps its own sleeve of cash and shares. On an exit the sleeve sells to cash; on a re-entry it buys back with whatever that sleeve holds."),
+        Callout("Why sleeves rather than daily rebalancing", [
+          "A daily-rebalanced equal-weight portfolio trades every symbol every day. It would cost more in brokerage than this strategy could ever save in drawdown.",
+          "Sleeves trade only when the signal changes, which is the entire point of a low-turnover design.",
+          "The cost is some weight drift as sleeves grow apart. Accepted deliberately, and stated rather than hidden.",
+        ]),
+        P("One consequence worth recording: five symbols listed after the backtest began, so their sleeves sit in cash until the stock exists. HYUNDAI's sleeve is idle for 3.8 years and JIOFIN's for 2.6. That is roughly two sleeves out of ninety-six earning nothing, which depresses the reported CAGR. It affects the strategy and the benchmark identically, so the drawdown comparison is unaffected, but the absolute return figures are lower than a cleaner universe would give."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 3
+      c.push(
+        H1("3. Costs: a non-issue, as predicted"),
+        Tbl(["", "Trades", "Costs", "Per year"], [
+          ["Strategy", "239", "Rs 5,868", "0.109% of capital"],
+          ["Buy & hold", "94", "Rs 1,102", "0.020% of capital"],
+          ["Difference", "145", "Rs 4,766", "0.088% of capital"],
+        ], [2400, 1800, 2400, 2400]),
+        P("Under nine hundredths of one percent of capital per year. There was never room for friction to matter at this turnover, and it is now measured rather than assumed. The whipsaw guards from Phase 5 are what make this true -- without them the same signal could easily trade ten times as often."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 4
+      c.push(
+        H1("4. The tax hypothesis, and why it failed"),
+        P("The expectation going into this phase was clear and, in hindsight, insufficiently examined. Every crash exit converts a long-term holding into a short-term one, moving the Indian rate from 12.5% to 20%. Drawdown reduction would therefore carry a hidden tax penalty that published results ignore, and quantifying it would be a genuine contribution."),
+        P("Two separate problems with that argument emerged on measurement."),
+
+        H2("4.1 The conversion barely happens"),
+        P("Only 23.3% of the strategy's sales are short-term. The strategy holds for YEARS between trades, so by the time an exit fires most positions are long past the twelve-month boundary. The effect is real but small."),
+
+        H2("4.2 The comparison itself was flawed"),
+        P("Buy-and-hold never sells, so on a realised basis it appears to pay no tax whatsoever. That is not a saving -- it is a deferral. It ends the period holding a large unrealised liability that crystallises the moment anyone actually wants the money."),
+        P("Comparing a strategy that realises gains against one that defers them, without pricing the deferral, overstates the strategy's penalty by the entire buy-and-hold liability. Both books are therefore liquidated at the final close:"),
+        Tbl(["", "Tax paid as we go", "Deferred liability", "Total if liquidated"], [
+          ["Strategy", "Rs 27,295", "Rs 246,178", "Rs 273,473"],
+          ["Buy & hold", "Rs 0", "Rs 317,958", "Rs 317,958"],
+        ], [2200, 2300, 2300, 2200]),
+        Callout("The strategy pays LESS tax, and that is not good news", [
+          "Rs 44,484 less, in fact - the opposite sign to the hypothesis.",
+          "But it pays less mainly because it EARNED less, and a smaller gain carries a smaller liability. Lower tax on a lower return is not a benefit.",
+          "This is why after-tax terminal wealth, not tax paid, is the only figure that settles the question.",
+        ], "warn"),
+
+        H2("4.3 What you actually walk away with"),
+        Tbl(["", "Terminal equity", "Tax if liquidated", "After-tax wealth", "CAGR"], [
+          ["Strategy", "Rs 35,78,159", "Rs 273,473", "Rs 33,04,685", "24.66%"],
+          ["Buy & hold", "Rs 36,67,081", "Rs 317,958", "Rs 33,49,123", "24.96%"],
+        ], [1800, 2000, 1900, 1900, 1400]),
+        P("A difference of -4.44% of capital over 5.4 years. In a window containing no crash, the protection costs roughly 0.8% a year and delivers nothing -- which is exactly what Phase 5 predicted, and is the correct behaviour for insurance in a year without a fire."),
+        P("The honest conclusion is that the tax effect is real but small, and swamped by the return difference. Reporting it as a headline contribution would have been overclaiming. What survives is narrower and still worth having: the deferred-liability comparison IS the part most backtests get wrong, and correcting it reverses the sign of the apparent result."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 5
+      c.push(
+        H1("5. Two latent bugs found on recheck"),
+        P("Neither was affecting current results. Both would have been severe on different data, and both would have produced output that looked like a finding rather than an error."),
+
+        H2("5.1 A missing price was valuing a holding at zero"),
+        P("When a price was absent, the equity calculation treated the position as worth nothing. That prints a fake crash in the equity curve on the day of the gap and a fake recovery the day after."),
+        P("A drawdown study that invents drawdowns is worse than useless. The current window contains only two such cells, so the measured impact was nil -- but the failure mode is exactly the kind that survives review, because the output is a plausible-looking dip rather than an error."),
+        P("Open positions are now valued at the last KNOWN price. Stale prices are used for valuation only; trading is still skipped entirely when the price is missing, because you cannot fill at a price the market never printed. A regression test pins both halves."),
+
+        H2("5.2 A tax bill that fell due after the backtest ended"),
+        P("Indian financial years end on 31 March, and the backtest ends on 5 June 2026. The final partial year's tax therefore falls due after the window closes, and was never deducted from the equity curve -- while still being counted in the reported total."),
+        P("The summary would have reported a liability the curve never paid. It happens to be zero in the current run, so nothing was wrong in practice, but the two figures could silently disagree. Any bill falling due beyond the window is now charged at the final bar."),
+        Callout("The pattern, again", [
+          "Neither bug raised an error, a warning, or an implausible number.",
+          "This is now the fifth time in the project that a defect has been found which produced quietly wrong output rather than a visible failure - alongside the six data defects, the regime look-ahead, the double lag in the state machine, and the geometric mean masquerading as a portfolio.",
+          "In a numerical pipeline the dangerous failures are the silent ones, and the only reliable defence is checking outputs against reality rather than against the code's own expectations.",
+        ], "warn"),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 6
+      c.push(
+        H1("6. Known limitations"),
+        Num("The rate values are unverified. They were built from documented Indian rates but not confirmed against a live broker contract note, and statutory rates change with each budget. They are isolated in CostConfig and TaxConfig so checking takes five minutes, and it should be done before publication."),
+        Num("Carry-forward of capital losses across financial years is not modelled. That understates the strategy's after-tax result, so the figures here err on the conservative side."),
+        Num("Tax is deducted on 31 March rather than as advance tax through the year. The timing affects the shape of the equity curve slightly, not the total."),
+        Num("The DP charge is applied per sell leg, not per scrip per day. Identical here since exits are never split across multiple orders in a day, but it would over-count if they were."),
+        Num("Slippage is a spread proxy and does not model the price impact of a large order. Irrelevant at Rs 10 lakh across ninety-six names; it would matter at institutional size."),
+        Num("Five sleeves sit in cash for part of the window because those stocks had not listed. This depresses both CAGRs equally and leaves the drawdown comparison intact, but absolute returns are understated."),
+
+        H1("7. Handoff to Phase 7"),
+        P("Phase 7 compares the four retraining schemes: rolling three-year, incremental monthly, EWMA with decay 0.994, and the volatility-purged variant."),
+        P("That comparison is only valid because intensity is a percentile of the TRAINING distribution rather than a raw score. A fixed cut on the raw score would mean four different things under four schemes, and the benchmark would be measuring the scoring scale instead of the schemes it claims to compare. The design decision that makes Phase 7 possible was taken in Phase 3, for exactly this reason."),
+        P("Ranking should be by drawdown reduction per unit of turnover rather than by raw return, since a scheme that trades constantly can buy a better drawdown figure at a cost that only surfaces in the tax bill."),
+      );
+
+      return c;
+    },
+  },
 };
 
 // =====================================================================

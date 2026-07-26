@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white">
-  <img alt="tests" src="https://img.shields.io/badge/tests-148%20passing-1E7B34">
+  <img alt="tests" src="https://img.shields.io/badge/tests-151%20passing-1E7B34">
   <img alt="universe" src="https://img.shields.io/badge/universe-96%20symbols-1F4E79">
   <img alt="bars" src="https://img.shields.io/badge/trading%20days-5820-1F4E79">
   <img alt="status" src="https://img.shields.io/badge/status-phase%206%20of%2010%20done-orange">
@@ -193,7 +193,7 @@ Optional metadata (`_source`, `_dq_score`, `_gap_filled`) is preserved if presen
 python scripts/run_all_phases.py            # every phase, in order
 python scripts/run_all_phases.py --phase 2  # one phase
 python scripts/run_all_phases.py --list     # what exists
-python -m pytest tests/ -q                  # 148 tests
+python -m pytest tests/ -q                  # 151 tests
 ```
 
 The pipeline is deterministic. Deleting `data/interim/`, `data/processed/` and
@@ -228,7 +228,7 @@ scripts/
 ├── run_all_phases.py single entry point for the whole pipeline
 └── build_docs.js     regenerates the per-phase documentation
 
-tests/                148 tests, causality enforced
+tests/                151 tests, causality enforced
 docs/phases/          one document per phase
 ```
 
