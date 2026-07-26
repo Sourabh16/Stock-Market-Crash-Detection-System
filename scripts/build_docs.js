@@ -529,6 +529,310 @@ const PHASES = {
   return c;
     },
   },
+
+  phase2: {
+    slug: "Phase2_Features",
+    docTitle: "QBEAST Phase 2 — Features",
+    runningHead: "QBEAST · Phase 2 — Features",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 2",
+        title: "Features",
+        subtitle: "Building the inputs that decide whether early detection is possible at all",
+        status: "STATUS: COMPLETE — 71 tests passing",
+        meta: [
+          "468,266 symbol-days × 10 model features · 5,820 days × 7 market features",
+          "All features >98.6% populated in the backtest window",
+          "Strongest measured signal: 3.91× lift over base rate",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      // ---------------------------------------------------------- 1
+      c.push(
+        H1("1. The central idea"),
+        P("The project requires detecting a crash two to ten days before it happens. It is tempting to treat that as a modelling problem — pick a better algorithm, tune it harder. It is not. It is a feature problem, and no amount of downstream cleverness can recover from getting it wrong."),
+        P("Isolation Forest finds whatever is unusual in what you give it. Give it today's return and it will faithfully report that today's minus six percent day was unusual — on the day it happened. That is a description, not a prediction. The model has done nothing wrong; it answered exactly the question it was asked."),
+        Callout("The design rule for this phase", [
+          "Every feature must measure market STRESS rather than price MOVEMENT.",
+          "Stress is slow. It builds while price is still roughly flat, which is what makes it available before the break rather than during it.",
+          "ret_1d is computed and returned for labelling, plotting and debugging, but it is NOT in FEATURE_COLUMNS and never reaches the model. A test guards against it leaking in later.",
+        ]),
+
+        H2("1.1 Three layers"),
+        Tbl(["Layer", "Scope", "Answers"], [
+          ["Slope and acceleration", "per stock", "Which direction, and is the move building or exhausting?"],
+          ["Precursors", "per stock", "Is stress accumulating in this name?"],
+          ["Cross-sectional", "whole universe", "Is this one stock, or is it everything at once?"],
+        ], [2600, 1700, 4700]),
+        P("The third layer exists because a single stock falling on its own news is an exit for that stock, whereas the whole market falling together is a different event needing a different response. Per-stock features cannot tell those apart. Only the cross-section can."),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 2
+      c.push(
+        H1("2. Layer 1 — slope and acceleration"),
+        P("Slope is how steeply price is moving; acceleration is whether that steepness is increasing or easing. In calculus terms, the first and second derivative."),
+        RichP([
+          { text: "Both are measured on the " }, { text: "logarithm", bold: true },
+          { text: " of price. A ten-rupee move means something very different for a 200-rupee stock than for a 20,000-rupee one; the slope of log price is percentage change per day, which means the same thing everywhere. It also makes the measure immune to stock splits." },
+        ]),
+
+        H2("2.1 How they are computed"),
+        P("Slope is a least-squares straight line fitted through the last few days of log price. Acceleration is the curvature term from a single quadratic fit — deliberately not the difference between two slope readings, because stacking two smoothers roughly doubles the lag, and lag is precisely what cannot be afforded when the goal is seeing a turn several days early."),
+        P("Because the trailing window is evenly spaced in time, both regressions collapse mathematically to a fixed set of weights. Each feature is therefore a single weighted sum over the trailing window. This is not merely fast: it makes causality structural. There is no code path that could look forward, so it cannot be broken by a later edit."),
+
+        H2("2.2 The sign pair is the signal logic"),
+        Tbl(["Slope", "Acceleration", "Phase", "Reading"], [
+          ["negative", "negative", "AcceleratingDecline", "falling and worsening — crash developing, EXIT"],
+          ["negative", "positive", "DeceleratingDecline", "selloff exhausting — watch for re-entry"],
+          ["positive", "positive", "AcceleratingAdvance", "rally building — ENTER"],
+          ["positive", "negative", "DeceleratingAdvance", "topping out — caution"],
+        ], [1300, 1600, 2500, 3600]),
+
+        H2("2.3 A bug worth understanding"),
+        P("To compare across stocks, slope is divided by the stock's own recent volatility, giving a reading in daily standard deviations. The first implementation used volatility measured over the most recent sixty days. On real RELIANCE data the COVID crash then scored only minus 1.67 sigma, which was plainly too mild."),
+        Callout("A crash was muting its own signal", [
+          "By mid-March 2020 the sixty-day volatility window was itself full of crash days. The denominator had grown, so the crash was quietly dividing away its own severity.",
+          "Lagging the volatility estimate by twenty days — so it describes the calm the move is departing FROM rather than the chaos it is creating — scores the same event at minus 3.01 sigma.",
+          "This self-normalisation trap recurs throughout the project. It is the same reason Bollinger Bands were rejected as a crash label in section 6.",
+        ], "warn"),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 3
+      c.push(
+        H1("3. Layer 2 — per-stock precursors"),
+        P("Crashes are not bolts from a clear sky. Before a large decline, several things usually shift while price is still roughly flat. Each is measurable, each is slow, and none requires today to have been a bad day."),
+        Tbl(["Feature", "Measures", "Why it should lead"], [
+          ["vol_ratio", "5-day volatility over 60-day", "Volatility clusters — turbulence precedes turbulence. A ratio, so 2.0 means twice this stock's own normal, whether that normal is 15% or 45%"],
+          ["vol_of_vol", "Instability of volatility itself", "A reliably volatile market is a different regime from one whose volatility is lurching; the second tends to precede dislocations"],
+          ["semidev_asym", "Downside versus upside deviation", "Ordinary volatility treats +3% and -3% as identical. This does not. Down-moves outgrowing up-moves is the shape that precedes a break"],
+          ["volume_z", "Log volume against 60-day baseline", "Volume picks up as positioning changes, often before price resolves"],
+          ["range_expansion", "Intraday range against baseline", "Widening daily ranges signal disagreement about price"],
+          ["gap_freq", "Frequency of overnight gaps", "Gaps are information arriving while the market is shut — a rising rate means the story is being written outside trading hours"],
+          ["illiquidity", "Amihud: return per rupee traded", "Liquidity thins before it disappears; market makers widen before they withdraw"],
+          ["dd_from_high", "Drawdown from 60-day high", "Context, not stress: the same volatility spike means something different at a high than 15% below it"],
+          ["slope_z, accel_z", "Trend shape", "See section 2"],
+        ], [1700, 2300, 5000]),
+
+        H2("3.1 A design choice a test forced"),
+        P("Downside asymmetry was originally written as the obvious ratio: downside deviation divided by upside deviation. A test hit a twenty-day window containing no up days at all — maximum bearish asymmetry — and the feature returned nothing, because it had divided by zero."),
+        P("The formulation was undefined exactly where the signal was strongest. It was replaced by a bounded index:"),
+        ...Code([
+          "semidev_asym = (downside - upside) / (downside + upside)",
+          "",
+          "   -1 = all upside      0 = symmetric      +1 = all downside",
+        ]),
+        P("Two benefits. It is always defined. And it is bounded, which matters for this model specifically: Isolation Forest splits at random points within a feature's observed range, so a single extreme outlier stretches that range and wastes most candidate splits on empty space."),
+
+        H2("3.2 Warmup is missing, not averaged"),
+        P("Bars without a complete window return nothing rather than a neutral default. A fabricated average during warmup is indistinguishable downstream from a genuine reading, and Isolation Forest would see a cluster of identical fabricated values as a dense, extremely normal region — precisely the wrong lesson."),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 4
+      c.push(
+        H1("4. Layer 3 — cross-sectional"),
+        Tbl(["Feature", "Measures"], [
+          ["breadth_decline", "Percent of the live universe in AcceleratingDecline"],
+          ["breadth_advance", "Percent in AcceleratingAdvance"],
+          ["median_slope_z", "How hard the typical stock is moving"],
+          ["dispersion", "Cross-sectional spread of daily returns"],
+          ["avg_corr", "Average pairwise correlation across the universe"],
+          ["pct_below_ma50", "Participation — percent below the 50-day average"],
+          ["n_live", "Universe size that day"],
+        ], [2500, 6500]),
+
+        H2("4.1 Why correlation is the interesting one"),
+        P("In calm markets, stocks move on their own news, so average pairwise correlation is low. As stress builds, everything begins moving together — investors sell what they can rather than what they want to, and individual stories stop mattering. Correlation therefore rises before the index breaks, which makes it one of the few genuinely leading cross-sectional measures. Dispersion is the same signal read from the other side: as correlation climbs, the spread of returns across the universe collapses."),
+
+        H2("4.2 An O(N) shortcut for an O(N-squared) problem"),
+        P("The direct route builds a correlation matrix each day and averages its off-diagonal: roughly 4,500 pairs across 5,820 days, repeated four times over in the Phase 7 retraining comparison."),
+        P("There is an exact shortcut. For an equal-weighted portfolio, the variance of the whole is the sum of individual variances plus all the cross-covariances. If every pairwise correlation is taken to be the same value, the cross terms collapse into a closed form that rearranges to give that correlation directly. Every term is a rolling mean, variance or sum."),
+        ...Code([
+          "rho = ( N^2 * Var_portfolio  -  sum(sigma_i^2) )",
+          "      -----------------------------------------------",
+          "      (  (sum sigma_i)^2     -  sum(sigma_i^2) )",
+        ]),
+        Callout("Validated, not assumed", [
+          "Against the direct O(N-squared) computation on the real panel: correlation of 0.9937, mean absolute deviation 0.011, maximum deviation 0.046, and 28 times faster.",
+          "The slow reference implementation ships alongside the fast one and is used only in tests, so the claim can be re-checked at any time rather than trusted.",
+        ], "good"),
+
+        H2("4.3 The live-universe rule"),
+        P("Every cross-sectional measure is computed only over symbols that actually existed and traded that day, using the listing mask from Phase 1. Otherwise “40% of stocks are falling” silently becomes “40% of stocks are falling, out of a denominator including companies that had not yet listed”, which is a different and meaningless quantity."),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 5
+      c.push(
+        H1("5. Findings"),
+        H2("5.1 The market-wide trigger, calibrated rather than guessed"),
+        P("With no tuning whatsoever, the fraction of the universe in AcceleratingDecline isolates genuine market events:"),
+        Tbl(["Date", "Universe declining", "Median slope", "Event"], [
+          ["2020-03-12", "92.1%", "-2.11", "COVID crash"],
+          ["2026-03-31", "90.5%", "-0.79", "—"],
+          ["2016-02-11", "90.1%", "-0.94", "Feb-2016 global selloff"],
+          ["2022-09-26", "87.2%", "-0.67", "Fed / GBP crisis"],
+          ["2021-12-20", "86.2%", "-0.82", "Omicron"],
+          ["2017-09-25", "84.5%", "-0.72", "—"],
+        ], [1800, 2400, 2200, 2600]),
+        P("Breadth alone is not enough. Around ninety percent of the universe was falling during both the COVID crash and ordinary pullbacks. Only the median slope separates them: minus 2.11 sigma against roughly minus 0.8. Hence a two-condition trigger, breadth at or above 75 percent AND median slope at or below minus 1.5 sigma — a threshold derived from measurement rather than chosen."),
+
+        H2("5.2 Signal strength, measured out of sample"),
+        P("Fitted on 2016-2020, tested on 2021-2026, against a label of forward five-day drawdown at or below minus five percent:"),
+        Tbl(["Rule", "Days", "P(crash)", "Lift"], [
+          ["base rate", "—", "11.0%", "1.00x"],
+          ["AcceleratingDecline alone, no model", "38,612", "12.0%", "1.10x"],
+          ["slope_z below -1 alone, no model", "3,451", "13.2%", "1.20x"],
+          ["intensity 0.95+ and AcceleratingDecline", "875", "20.7%", "1.88x"],
+          ["intensity 0.99+ and AcceleratingDecline", "107", "43.0%", "3.91x"],
+        ], [3600, 1600, 1800, 2000]),
+        Callout("Isolation Forest is doing the work", [
+          "The trend rules alone are worth almost nothing — 1.10x and 1.20x against a base rate of 1.00x.",
+          "The anomaly score carries the signal; slope and acceleration convert \"unusual\" into \"unusually bad\".",
+          "The rally side tells the same story. AcceleratingAdvance alone scores 0.98x — literally no information. Combined with intensity above 0.99 it reaches 2.44x.",
+        ], "good"),
+
+        H2("5.3 A warning that must not be buried"),
+        P("Ranked across all days, the detector achieves an area under the curve of 0.53 against the crash label — barely above a coin flip. Some of that is expected and unfair to the model: Isolation Forest is direction-blind, so it ranks violent rallies exactly as highly as violent crashes, and a crash-only label penalises it for doing its job. Applying the direction filter is what lifts precision to 3.91 times base rate."),
+        P("But a separate probe on the market-level features gave a harder result. Trained on all history through 2020, the detector fired zero alerts across 1,344 out-of-sample days — never once in five years. Volatility purging restored firing to roughly three per year, yet it still caught only one of eight crash onsets."),
+        Callout("Read this honestly", [
+          "This is a warning sign, not a verdict. The probe used only the six market features rather than the 468,266 rows of per-stock features, and eight out-of-sample events cannot support a confident conclusion.",
+          "But it is real enough that Phase 4 — measuring actual lead time — must come before any backtest, dashboard, or retraining comparison is built on top of it.",
+          "Far better to learn this from a lead-time histogram in Phase 4 than from an equity curve in Phase 8.",
+        ], "warn"),
+
+        H2("5.4 A retraining hypothesis, confirmed early"),
+        P("The zero-alert result is not a bug. Isolation Forest defines normal as whatever it was trained on, and the training set contained 2008 and March 2020. Having been shown catastrophe, the model learned that catastrophe is normal, and no subsequent day was extreme enough to clear the threshold."),
+        Tbl(["Training set", "Alerts in 1,344 out-of-sample days"], [
+          ["All history 2006-2020", "0"],
+          ["Crisis periods removed", "5"],
+          ["Volatility-purged, top decile dropped", "15"],
+          ["2016-2020 including COVID", "1"],
+          ["2016-2020 volatility-purged", "42"],
+        ], [5000, 4000]),
+        P("This was proposed in the implementation plan as a fourth challenger to the three retraining methods. It is no longer a theoretical argument — it is measured, and it should now be treated as the default rather than the alternative."),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 6
+      c.push(
+        H1("6. Considered and rejected: Bollinger Bands"),
+        P("Bollinger Bands were evaluated both as a crash label and as a feature. Recording the reasoning because the conclusion is not obvious and the investigation produced a genuinely useful result."),
+
+        H2("6.1 As a crash label — rejected"),
+        P("Band position is volatility-relative, so a sustained crash widens its own band. The reading becomes LESS extreme as the drawdown deepens:"),
+        Tbl(["Date", "Drawdown from peak", "Band position"], [
+          ["2020-02-28", "-9%", "-2.85 SD"],
+          ["2020-03-12", "-22%", "-2.70 SD"],
+          ["2020-03-23", "-38%", "-2.01 SD"],
+        ], [2600, 3200, 3200]),
+        P("The band half-width grew from 3.1 percent of price to 32.1 percent. During the worst crash in the dataset, a 2.5-sigma band flagged three days out of thirty, and at the minus 38 percent bottom price sat comfortably inside it. The relationship runs backwards for exactly the events that matter most, and unlike the slope_z case there is no fix available — the band IS the normaliser."),
+        P("To be fair to the method, it is not noise. Measured contemporaneously against sharp drops it reaches 33 percent precision at 2.5 sigma, and 70 percent recall at 1.5 sigma. It is a legitimate coincident detector of sudden drops. It fails specifically on SUSTAINED crashes, which is the failure mode a drawdown-focused strategy can least afford."),
+
+        H2("6.2 As a feature — rejected"),
+        P("Measured incremental value on the hold-out period:"),
+        Tbl(["Feature set", "AUC", "Precision at top 5%"], [
+          ["baseline, 10 features", "0.5300", "20.1%"],
+          ["plus band position", "0.5300", "19.2%"],
+          ["plus bandwidth", "0.5324", "21.4%"],
+          ["plus both", "0.5348", "21.5%"],
+        ], [3600, 2400, 3000]),
+        P("Band position contributes exactly nothing on its own and slightly lowers precision. It correlates 0.69 with the downside asymmetry measure and 0.68 with slope, so it is largely a restatement of information already present. Bandwidth adds a marginal amount. Neither was judged to earn its place, and both were left out."),
+
+        H2("6.3 What the investigation did settle"),
+        P("The crash label stays defined on ABSOLUTE magnitude, never on band position. Drawdown is what hurts a portfolio, and it is absolute: losing thirty percent hurts identically whether it happened in a calm year or a wild one. Measured base rates on the index:"),
+        Tbl(["Forward 5-day drawdown worse than", "Share of days"], [
+          ["-3%", "14.49%"],
+          ["-5%", "5.44%"],
+          ["-6%", "3.27%"],
+          ["-10%", "0.85%"],
+        ], [5000, 4000]),
+        P("A minus five percent threshold occurs on 5.44 percent of days, which happens to align almost exactly with the five percent anomaly rate conventionally quoted for this kind of model. That agreement is a useful cross-check on both numbers."),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 7
+      c.push(
+        H1("7. A note on contamination"),
+        P("Isolation Forest exposes a contamination parameter, usually described as the expected proportion of anomalies. It is natural to reach for it and set it to five percent."),
+        P("Measured across values from 0.001 to 0.2, the raw anomaly scores are bit-for-bit identical. Contamination does not affect tree building at all. It sets only an internal offset used to convert scores into a binary in-or-out label."),
+        RichP([
+          { text: "This pipeline never uses that binary label. Intensity is the raw score mapped through the " },
+          { text: "training-set empirical distribution", bold: true },
+          { text: ", so contamination never enters the calculation. That is deliberate: setting contamination amounts to asserting how much of history was a crash, which is a guess you would then be scored against. A measured percentile replaces the guess." },
+        ]),
+        P("The five percent intuition is still useful — it just belongs to the intensity THRESHOLD rather than to the model. An intensity cut at 0.95 means acting on the most unusual five percent of days; a cut at 0.99, the most unusual one percent."),
+
+        H1("8. Tests"),
+        P("71 passing. What matters is what they prove."),
+        Tbl(["Group", "Proves"], [
+          ["Future perturbation", "Rewriting the future leaves every earlier feature bit-identical"],
+          ["Streaming equals batch", "Day-by-day computation reproduces the batch result — the live-trading contract"],
+          ["No same-day return", "ret_1d cannot leak into the model"],
+          ["Correlation shortcut", "The O(N) form tracks the direct O(N-squared) computation"],
+          ["Flat-bar masking", "Zero-range bars are excluded from range features"],
+          ["Asymmetry defined", "The bounded form survives a window with no up days"],
+          ["Volatility transition", "vol_ratio spikes at a regime change"],
+          ["Listing mask", "Breadth counts only companies that existed"],
+          ["No infinities", "A single infinity would make every finite value look identical"],
+        ], [2900, 6100]),
+        Break(),
+      );
+
+      // ---------------------------------------------------------- 8
+      c.push(
+        H1("9. Results"),
+        ...Code([
+          "per-stock: 468,266 symbol-days x 10 model features",
+          "",
+          "  vol_ratio           99.8% non-null",
+          "  vol_of_vol          99.7% non-null",
+          "  semidev_asym        99.9% non-null",
+          "  volume_z            99.9% non-null",
+          "  range_expansion     98.6% non-null",
+          "  gap_freq            99.9% non-null",
+          "  illiquidity         99.9% non-null",
+          "  dd_from_high        99.9% non-null",
+          "  slope_z             99.7% non-null",
+          "  accel_z             99.7% non-null",
+          "",
+          "cross-sectional (2016 onward), median / p1 / p99:",
+          "  breadth_decline    19.10    1.04   77.95",
+          "  median_slope_z      0.04   -0.78    0.64",
+          "  dispersion          1.64    0.94    3.39",
+          "  avg_corr            0.24    0.11    0.48",
+          "  pct_below_ma50     39.29    3.16   92.13",
+        ]),
+
+        H1("10. Known limitations"),
+        Num("Predictive power is modest and unproven. The strongest rule reaches 3.91 times base rate, on 107 observations that are heavily overlapping — the same market event appears across many correlated stocks on the same day, so the effective independent sample is far smaller than the count suggests."),
+        Num("The leading-feature thesis is not yet demonstrated. Features were chosen because there are good reasons they should lead. Whether they actually do is what Phase 4 measures, and the market-level probe gives grounds for caution."),
+        Num("Pre-crash markets look calmer and stronger than average. Median slope is positive ten days before an onset. Crashes here begin from strength, not from visible weakness, which complicates the premise that stress accumulates visibly beforehand."),
+        Num("The correlation shortcut assumes homogeneous correlations and roughly stable membership within each window. It tracks the true average closely, but it is an approximation."),
+        Num("Feature parameters — 5, 20 and 60-day windows, the 20-day volatility lag — are conventional choices, not optimised. Optimising them against the hold-out would be a form of look-ahead."),
+
+        H1("11. Handoff to Phase 3"),
+        P("Phase 3 fits Isolation Forest and converts its scores into intensity. It inherits a long-format table of 468,266 symbol-days by 10 features, a daily market-state block, and a settled crash definition based on absolute magnitude."),
+        P("Three decisions carry forward. The model is fitted on the POOLED cross-section rather than per symbol, so one model learns what normal looks like across the whole universe. Intensity is the percentile of the score against the TRAINING distribution, which is what makes the four retraining schemes comparable. And max_samples, not contamination, is the parameter that actually needs tuning."),
+        Callout("Phase 4 is the decision point", [
+          "Phase 3 produces intensity. Phase 4 measures whether it arrives early enough to be worth anything.",
+          "No backtest, no retraining comparison, and no dashboard should be built until that lead-time histogram exists.",
+        ], "warn"),
+      );
+
+      return c;
+    },
+  },
 };
 
 // =====================================================================
