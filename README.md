@@ -10,7 +10,7 @@
   <img alt="tests" src="https://img.shields.io/badge/tests-183%20passing-1E7B34">
   <img alt="universe" src="https://img.shields.io/badge/universe-96%20symbols-1F4E79">
   <img alt="bars" src="https://img.shields.io/badge/trading%20days-5820-1F4E79">
-  <img alt="status" src="https://img.shields.io/badge/status-phase%208%20of%2010%20done-orange">
+  <img alt="status" src="https://img.shields.io/badge/status-phase%208%2C10%20of%2010%20done-orange">
 </p>
 
 ---
@@ -253,7 +253,7 @@ broken by a later edit.
 | 7 | Retraining method comparison | ✅ done |
 | 8 | Drawdown analysis + per-stock charts | ✅ done |
 | 9 | Robustness experiment | ⬜ |
-| 10 | HTML dashboard | ⬜ |
+| 10 | HTML dashboard | ✅ done |
 
 **Phase 4 decides whether the project is viable.** It measures how many days of warning the
 model actually gives. If the lead time is not there, then signals, backtesting and

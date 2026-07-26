@@ -43,3 +43,6 @@ package-lock.json
 
 # Fitted models (regenerable — run scripts/run_all_phases.py)
 /models/
+
+# Generated dashboard (6 MB; rebuild with scripts/build_dashboard.py)
+/reports/dashboard.html
