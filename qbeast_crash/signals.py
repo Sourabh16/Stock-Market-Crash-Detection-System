@@ -50,7 +50,24 @@ from qbeast_crash.config import DEFAULT_CONFIG, SignalConfig
 import numpy as np
 import pandas as pd
 
+#: Every action that closes a position. Both paths sell -- a severe anomaly
+#: acts the next day, a mild one sells from inside its watch -- and every count
+#: of "trades" or "symbols traded" must include both.
+#:
+#: This exists because adding EXIT_WATCH silently broke eight separate counts
+#: that each tested `action == "EXIT"`. Phase 6 reported 82 trades while Phase 8
+#: reported 7 of 10 symbols never traded, from the same signal file.
+SELL_ACTIONS = ("EXIT", "EXIT_WATCH")
+
+
+def is_sell(actions) -> "pd.Series":
+    """True where the action closed a position, by either path."""
+    return actions.isin(SELL_ACTIONS)
+
+
 __all__ = [
+    "SELL_ACTIONS",
+    "is_sell",
     "SignalConfig",
     "ReentryRule",
     "generate_signals",

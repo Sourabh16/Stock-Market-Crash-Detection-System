@@ -36,6 +36,8 @@ matplotlib.use("Agg")                       # no display on a headless machine
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
+from qbeast_crash.signals import is_sell
+
 __all__ = ["DrawdownStats", "drawdown_series", "drawdown_stats",
            "plot_symbol", "plot_portfolio", "plot_drawdown_scatter",
            "plot_scheme_comparison", "plot_portfolio_schemes",
@@ -185,7 +187,7 @@ def plot_symbol(
         for a, b in zip(close.index[starts], close.index[ends]):
             ax.axvspan(a, b, color=EXIT, alpha=0.10, zorder=1)
 
-    exits = signals.index[signals["action"] == "EXIT"]
+    exits = signals.index[is_sell(signals["action"])]
     entries = signals.index[signals["action"] == "ENTER"]
     if len(exits):
         ax.scatter(exits, close.reindex(exits), marker="v", s=70, color=EXIT,
@@ -423,7 +425,7 @@ def plot_scheme_comparison(
         # Each scheme gets its own horizontal band, so a sell and the buy that
         # follows it are visibly paired rather than lost in a common row.
         row = lo - span * (0.06 + 0.055 * i)
-        sells = sig.index[sig["action"] == "EXIT"]
+        sells = sig.index[is_sell(sig["action"])]
         buys = sig.index[sig["action"] == "ENTER"]
         if len(sells):
             ax.scatter(sells, np.full(len(sells), row), marker=marker, s=52,

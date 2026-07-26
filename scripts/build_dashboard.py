@@ -45,6 +45,7 @@ import pandas as pd
 
 from qbeast_crash.config import DATA_PROCESSED, DEFAULT_CONFIG, REPORTS
 from qbeast_crash.data import load_universe, trading_calendar
+from qbeast_crash.signals import is_sell
 
 CFG = DEFAULT_CONFIG
 OUT = REPORTS / "dashboard.html"
@@ -93,8 +94,9 @@ def collect() -> dict:
             "intensity": [None if not np.isfinite(v) else round(float(v), 4) for v in inten],
             "dd_strategy": [round(float(v), 4) for v in (strat / strat.cummax() - 1)],
             "dd_bench": [round(float(v), 4) for v in (bench / bench.cummax() - 1)],
-            "sells": [d.strftime("%Y-%m-%d") for d in sig.index[sig["action"] == "EXIT"]],
+            "sells": [d.strftime("%Y-%m-%d") for d in sig.index[is_sell(sig["action"])]],
             "buys": [d.strftime("%Y-%m-%d") for d in sig.index[sig["action"] == "ENTER"]],
+            "anomalies": _anomaly_rows(sym, close, sig, intensity),
         }
 
     portfolio = {}
@@ -126,6 +128,58 @@ def collect() -> dict:
         "cost_summary": _csv("phase6_summary.csv", index_col=0),
         "audit": audit,
     }
+
+
+def _anomaly_rows(sym, close, sig, intensity) -> list[dict]:
+    """
+    Every day the model called unusual, with what it saw and what it did.
+
+    Only days above the "watch" threshold are listed. Including ordinary days
+    would bury the interesting ones in thousands of rows.
+    """
+    try:
+        block = intensity.xs(sym, level="symbol").reindex(close.index)
+    except KeyError:
+        return []
+
+    cfg = CFG.signals
+    flagged = block["intensity"] >= cfg.moderate_intensity
+    if not flagged.any():
+        return []
+
+    action_label = {"EXIT": "SELL", "EXIT_WATCH": "SELL (from watch)", "ENTER": "BUY"}
+    held = sig["in_position"].fillna(True).astype(bool)
+    watching = (sig["watching"].fillna(False).astype(bool)
+                if "watching" in sig else pd.Series(False, index=sig.index))
+
+    rows = []
+    for d in block.index[flagged.fillna(False)]:
+        a = sig["action"].get(d, "")
+        if a in action_label:
+            label = action_label[a]
+        elif not held.get(d, True):
+            # Already sold and sitting in cash. Calling this "watch only" reads
+            # as inaction when the model had in fact already acted -- the most
+            # confusing rows in the table were the days AFTER a sell.
+            label = "already out"
+        elif watching.get(d, False):
+            label = "watching"
+        else:
+            label = "no action"
+        rows.append({
+            "date": d.strftime("%Y-%m-%d"),
+            "score": round(float(block.loc[d, "anomaly_score"]), 4)
+                     if "anomaly_score" in block else None,
+            "intensity": round(float(block.loc[d, "intensity"]), 4),
+            "severity": "Severe" if block.loc[d, "intensity"] >= cfg.exit_intensity else "Mild",
+            "slope": round(float(block.loc[d, "slope_z"]), 2),
+            "accel": round(float(block.loc[d, "accel_z"]), 2),
+            "regime": str(block.loc[d, "regime"]) if "regime" in block else "—",
+            "trend": str(block.loc[d, "phase"]),
+            "ret": round(float(block.loc[d, "ret_1d"]), 2) if "ret_1d" in block else None,
+            "action": label,
+        })
+    return rows
 
 
 def png_b64(path: Path) -> str:
@@ -302,438 +356,8 @@ def callout(title, body, tone="") -> str:
 
 
 # =====================================================================
-# Tabs
+# Small formatters used inside the f-strings below
 # =====================================================================
-def tab_overview(d: dict) -> str:
-    t = d["drawdown_table"]
-    cs = d["cost_summary"]
-    sch = d["schemes"]
-
-    traded = int((t["exits"] > 0).sum()) if len(t) else 0
-    untouched = len(t) - traded
-    helped = int((t["drawdown_saved_pp"] > 0.1).sum()) if len(t) else 0
-    hurt = int((t["drawdown_saved_pp"] < -0.1).sum()) if len(t) else 0
-    mean_saved = float(t["drawdown_saved_pp"].mean()) if len(t) else 0.0
-    med_saved = float(t["drawdown_saved_pp"].median()) if len(t) else 0.0
-
-    s_row = cs.loc["strategy"] if "strategy" in cs.index else None
-    b_row = cs.loc["buy & hold"] if "buy & hold" in cs.index else None
-
-    kpis = [
-        kpi("Universe", f'{d["n_symbols"]}', f'{d["n_sessions"]} sessions'),
-        kpi("Symbols traded", f"{traded}", f"{untouched} never touched", "cy"),
-        kpi("Mean DD saved", f"{mean_saved:+.2f}pp", "across all symbols",
-            "pos" if mean_saved > 0 else "neg"),
-        kpi("Median DD saved", f"{med_saved:+.2f}pp", "most symbols untouched", "wn"),
-    ]
-    if s_row is not None and b_row is not None:
-        kpis += [
-            kpi("Strategy CAGR", F_pct(s_row.get("cagr_net_all")),
-                "net of costs and tax"),
-            kpi("Buy & hold CAGR", F_pct(b_row.get("cagr_net_all")), "same basis"),
-            kpi("Strategy max DD", F_pct(s_row.get("maxdd")), "portfolio level"),
-            kpi("Buy & hold max DD", F_pct(b_row.get("maxdd")), "portfolio level"),
-        ]
-
-    return f"""
-    <h2>What this system does</h2>
-    <p class="sub">Stays fully invested by default and steps out when an Isolation Forest
-    flags an unusual day that slope and acceleration confirm is a decline. Trained
-    {d["train_window"]}, tested {d["window"]}.</p>
-
-    {callout("Read these three limits before the numbers", [
-      "It has <b>no early-warning skill</b>. Against a random signal of identical firing rate, recall was 0.88x — no better than chance at a 15-day horizon. This is a fast-reaction system, not a predictive one.",
-      "It reduces drawdown <b>depth</b> slightly and <b>duration</b> not at all. Median sessions under water are identical to buy-and-hold.",
-      f"It never trades <b>{untouched} of {len(t)}</b> symbols, so the median drawdown saved is {med_saved:+.2f}pp while the mean is {mean_saved:+.2f}pp. The mean alone would imply a broad effect where there is a narrow one."
-    ], "warn")}
-
-    <div class="grid g4">{"".join(kpis)}</div>
-
-    <h2>Portfolio</h2>
-    <p class="sub">Equity and drawdown, net of the full NSE cost stack and capital
-    gains tax.</p>
-    <div class="chart"><h3>Equity</h3><div id="pf-eq" style="height:330px"></div></div>
-    <div class="chart"><h3>Drawdown</h3><div id="pf-dd" style="height:230px"></div></div>
-
-    <h2>Where it helped, and where it did not</h2>
-    <div class="grid g3">
-      {kpi("Shallower drawdown", f"{helped}", "symbols", "pos")}
-      {kpi("Deeper drawdown", f"{hurt}", "symbols", "neg")}
-      {kpi("Unchanged", f"{untouched}", "never traded", "dim")}
-    </div>
-    <div class="chart"><h3>Per-symbol drawdown — above the diagonal means the model helped</h3>
-      <div id="ov-scatter" style="height:460px"></div></div>
-
-    {callout("The result that reframes who this is for", [
-      "Per-stock savings do not aggregate. On the ten-stock portfolio ADANIENT alone saved 17.5pp and ITC 12.0pp, yet the portfolio improved only 1.0pp.",
-      "Stocks trough at different times. ADANIENT's worst moment was February 2023; the portfolio's was March 2026, when ADANIENT was not the problem. Diversification had already absorbed most of what the model avoided.",
-      "It is a <b>single-stock risk tool that aggregates weakly</b>, not a portfolio hedge."
-    ], "bad")}
-    """
-
-
-def tab_data(d: dict) -> str:
-    a = d["audit"]
-    trunc = a[a["truncated_rows"] > 0] if "truncated_rows" in a else pd.DataFrame()
-    dropped = a[~a["usable"]] if "usable" in a else pd.DataFrame()
-
-    defects = [
-        ("1", "adj_close is not an adjusted series",
-         "Differs from close on ~30 of ~5,800 bars. A real adjustment factor differs on every bar before the last corporate action.",
-         "Discarded; close is already back-adjusted"),
-        ("2", "Fabricated pre-IPO history",
-         "MAZDOCK carries monthly-spaced bars from 2017 but listed October 2020. Same in DMART, SBILIFE, VBL.",
-         "Truncated by a calendar-gap rule"),
-        ("3", "Zero-range bars",
-         "BAJFINANCE has 1,092 of 5,803 bars where open = high = low = close.",
-         "Flagged, never dropped — deleting a row shifts every window spanning it"),
-        ("4", "Ragged end dates",
-         "Files end anywhere between 2026-06-03 and 2026-06-22.",
-         "Trimmed to a common 2026-06-05"),
-        ("5", "Survivorship bias",
-         "The universe is today's NIFTY 100, so companies that fell out are invisible.",
-         "Documented as a limitation, not fixed"),
-        ("6", "Unadjusted corporate actions",
-         "CGPOWER falls 155.30 to 53.05 on 2016-03-15 — the Crompton Greaves demerger. Passes every structural check; only the return betrays it.",
-         "Truncated; real crashes such as Hindenburg preserved"),
-    ]
-    rows = "".join(
-        f"<tr><td class='mono cy'>{n}</td><td><b>{title}</b></td>"
-        f"<td style='color:var(--muted)'>{ev}</td><td>{fix}</td></tr>"
-        for n, title, ev, fix in defects)
-
-    listings = [("VBL", "2016-11-08"), ("DMART", "2017-03-21"),
-                ("SBILIFE", "2017-10-03"), ("MAZDOCK", "2020-10-12")]
-    lrows = "".join(
-        f"<tr><td class='mono'>{s}</td><td class='mono num'>{v}</td>"
-        f"<td class='mono num'>{v}</td><td><span class='pill ok'>exact</span></td></tr>"
-        for s, v in listings)
-
-    return f"""
-    <h2>Six defects, none of which would have raised an error</h2>
-    <p class="sub">Every one produced output that looked completely normal — valid dates,
-    positive prices, plausible returns. This matters more here than in most pipelines
-    because Isolation Forest is unsupervised: a supervised model shown a bad example
-    pushes back through its error signal, whereas this one silently absorbs it and
-    learns that whatever it was shown is normal.</p>
-
-    <div class="card"><div class="scroll"><table>
-      <thead><tr><th>#</th><th>Defect</th><th>Evidence</th><th>Handling</th></tr></thead>
-      <tbody>{rows}</tbody></table></div></div>
-
-    <h2>The gap rule, validated against reality</h2>
-    <p class="sub">A calendar gap over 10 days is always a vendor artefact — the NSE has
-    never closed that long. Validated against listing dates sourced independently of this
-    codebase, not against the code's own output.</p>
-    <div class="card"><table>
-      <thead><tr><th>Symbol</th><th class="num">Rule detected</th>
-      <th class="num">Actual NSE listing</th><th>Match</th></tr></thead>
-      <tbody>{lrows}</tbody></table></div>
-
-    <div class="grid g3" style="margin-top:16px">
-      {kpi("Usable symbols", f'{len(a[a["usable"]]) if "usable" in a else 0}', "of 100 supplied")}
-      {kpi("Symbols truncated", f"{len(trunc)}", "fabricated history removed", "wn")}
-      {kpi("Symbols dropped", f"{len(dropped)}", "insufficient history", "neg")}
-    </div>
-
-    {callout("Gaps are never forward-filled", [
-      "A carried-forward price manufactures a return of exactly zero, and a run of zeros reads to the model as a stretch of unnatural calm — biasing every volatility estimate downward.",
-      "Measured: 0.53% of daily returns are exactly zero. Forward-filling would inflate that substantially, and nothing in the output would look wrong."
-    ])}
-    """
-
-
-def tab_detection(d: dict) -> str:
-    h = d["horizon"]
-    lt = d["leadtime"]
-
-    hrows = "".join(
-        f"<tr><td class='num mono'>{int(r.horizon)}</td>"
-        f"<td class='num mono'>{r.base*100:.2f}%</td>"
-        f"<td class='num mono cy'>{r.given_signal*100:.2f}%</td>"
-        f"<td class='num mono pos'>{r.lift:.1f}x</td></tr>"
-        for _, r in h.iterrows()) if len(h) else ""
-
-    lrows = ""
-    if len(lt):
-        for name, r in lt.iterrows():
-            lrows += (f"<tr><td>{name}</td><td class='num mono'>{int(r.get('signals',0))}</td>"
-                      f"<td class='num mono'>{r.get('recall',0)*100:.1f}%</td>"
-                      f"<td class='num mono'>{r.get('random_recall',0)*100:.1f}%</td>"
-                      f"<td class='num mono {'pos' if r.get('skill',0)>1 else 'neg'}'>"
-                      f"{r.get('skill',0):.2f}x</td></tr>")
-
-    return f"""
-    <h2>The go/no-go result</h2>
-    <p class="sub">This phase existed to answer one question: how many days before a crash
-    does the signal fire? The answer changed what the project can claim.</p>
-
-    {callout("No early warning beyond chance", [
-      "Crash events are frequent enough that any rule firing often will land near one by chance, so raw recall proves nothing. Every rule was measured against a <b>random signal of identical firing rate</b>.",
-      "All rules scored at or below 1.00x skill. At a 15-day horizon the detector provides no early warning. The requirement to predict crashes 2–3 days ahead, in the sense of forecasting from a calm market, is <b>not met</b>."
-    ], "bad")}
-
-    <div class="card"><table>
-      <thead><tr><th>Rule</th><th class="num">Signals</th><th class="num">Recall</th>
-      <th class="num">Random</th><th class="num">Skill</th></tr></thead>
-      <tbody>{lrows}</tbody></table></div>
-
-    <h2>But the signal is enormously informative at short horizon</h2>
-    <p class="sub">Probability of a 10% drawdown within H days, given a signal.
-    The lift decays sharply with horizon — the signature of a coincident detector
-    rather than a predictive one.</p>
-    <div class="grid g2">
-      <div class="card"><table>
-        <thead><tr><th class="num">H</th><th class="num">Base rate</th>
-        <th class="num">Given signal</th><th class="num">Lift</th></tr></thead>
-        <tbody>{hrows}</tbody></table></div>
-      <div class="chart"><h3>Lift decay</h3><div id="det-lift" style="height:280px"></div></div>
-    </div>
-
-    {callout("Precision and recall are both true at once", [
-      "Phase 3 reported 3.48x lift; this phase reports no skill. Both are correct because they measure different things.",
-      "<b>Precision</b> — P(crash | signal) — is high. <b>Recall</b> — P(signal | crash) — is low. The signal is precise but rare, firing on 130 of 128,737 symbol-days, so it can only ever cover a fraction of events.",
-      "The median same-day return on signal days is −1.14% against +0.02% overall: it fires as a decline <i>begins</i>, not before it."
-    ])}
-    """
-
-
-def tab_schemes(d: dict) -> str:
-    sc = d["schemes"]
-    dec = d["decay"]
-
-    rows = "".join(
-        f"<tr><td><span class='pill dim'>{name}</span></td>"
-        f"<td class='num mono'>{r.cagr*100:.2f}%</td>"
-        f"<td class='num mono'>{r.max_drawdown*100:.1f}%</td>"
-        f"<td class='num mono {F_cls(r.drawdown_saved_pp)}'>{r.drawdown_saved_pp:+.1f}pp</td>"
-        f"<td class='num mono'>{r.trades_per_sym_yr:.2f}</td>"
-        f"<td class='num mono'>{r.efficiency:.1f}</td></tr>"
-        for name, r in sc.iterrows()) if len(sc) else ""
-
-    drows = "".join(
-        f"<tr><td class='mono'>{r.decay:.4f}</td>"
-        f"<td class='num mono'>{r.eff_years:.2f}y</td>"
-        f"<td class='num mono {F_cls(r.dd_saved_pp)}'>{r.dd_saved_pp:+.1f}pp</td>"
-        f"<td class='num mono'>{r.trades_per_sym_yr:.2f}</td>"
-        f"<td class='num mono'>{r.efficiency:.1f}</td></tr>"
-        for _, r in dec.iterrows()) if len(dec) else ""
-
-    return f"""
-    <h2>Four ways to choose training data</h2>
-    <p class="sub">Walk-forward, monthly refits. All four share the same schedule so only
-    the training <i>set</i> varies — changing the frequency too would confound the effects.
-    The comparison is only valid because intensity is a percentile of each fit's own
-    training distribution rather than a raw score.</p>
-
-    <div class="card"><table>
-      <thead><tr><th>Scheme</th><th class="num">CAGR</th><th class="num">Max DD</th>
-      <th class="num">vs B&amp;H</th><th class="num">Trades/sym/yr</th>
-      <th class="num">Efficiency</th></tr></thead>
-      <tbody>{rows}</tbody></table></div>
-
-    {callout("The scheme choice does not matter", [
-      "The spread across all four is 0.2pp of drawdown. They are within noise of each other, which tells you where <i>not</i> to spend further effort.",
-      "If one must be chosen: <b>rolling</b> — best efficiency and simplest to reason about. <code>vol_purged</code> trades nearly twice as often for no benefit and can be retired."
-    ], "warn")}
-
-    <h2>But retraining matters enormously — for coverage, not accuracy</h2>
-    <p class="sub">Measuring coverage separately from performance surfaced the largest
-    effect in the project.</p>
-    <div class="grid g4">
-      {kpi("Static fit", "44 / 96", "symbols the model could trade", "neg")}
-      {kpi("Walk-forward", "79 / 96", "rolling scheme", "pos")}
-      {kpi("Dev universe, static", "3 / 10", "before", "neg")}
-      {kpi("Dev universe, walk-forward", "8 / 10", "after", "pos")}
-    </div>
-    {callout("Why most stocks could never fire", [
-      "Intensity was a percentile of the <b>pooled</b> training distribution, dominated by the most volatile names. RELIANCE's highest intensity in 5.4 years was 0.9897 — a 0.99 threshold was unreachable by construction.",
-      "And the 2016–2020 training window contains COVID, so each stock's own top percentile is set by March 2020, which calm 2021–2026 never approaches. A rolling three-year window in 2024 contains no COVID, so the bar drops to something reachable.",
-      "<b>Retraining is what makes the model act at all</b> — a far larger effect than any accuracy difference between schemes."
-    ], "good")}
-
-    <h2>EWMA decay — the one parameter that does matter</h2>
-    <p class="sub">A single sweep proves nothing, so the noise floor was measured first
-    (sd 0.05pp), then the candidates were run on four seeds each.</p>
-    <div class="grid g2">
-      <div class="card"><table>
-        <thead><tr><th>Decay</th><th class="num">Memory</th><th class="num">DD saved</th>
-        <th class="num">Trades</th><th class="num">Efficiency</th></tr></thead>
-        <tbody>{drows}</tbody></table></div>
-      <div class="chart"><h3>Drawdown saved by decay</h3>
-        <div id="sc-decay" style="height:290px"></div></div>
-    </div>
-    {callout("0.994 is vindicated on measurement", [
-      "0.994 and 0.997 sit 0.27pp apart with a pooled sd of 0.09 — a separation of <b>3.1 standard deviations</b>. Real signal, not luck.",
-      "0.994 also has the lowest variance across seeds, so it is the most stable as well as the best. Note the contrast: the choice of <i>scheme</i> does not matter, but within EWMA the <i>decay</i> does."
-    ], "good")}
-
-    <div class="chart"><h3>Portfolio by scheme</h3>
-      <div class="imgwrap"><img src="data:image/png;base64,{d['img_schemes']}" alt="portfolio by scheme"></div></div>
-    """
-
-
-def tab_portfolio(d: dict) -> str:
-    cs = d["cost_summary"]
-    if not len(cs):
-        return "<p class='sub'>Run phase 6 first.</p>"
-    s = cs.loc["strategy"]; b = cs.loc["buy & hold"]
-
-    return f"""
-    <h2>Costs and tax</h2>
-    <p class="sub">The full NSE delivery stack — STT on both legs, stamp duty on buys,
-    DP charges on sells, GST, exchange and SEBI fees — plus Indian capital gains,
-    with rates that change inside the backtest window.</p>
-
-    <div class="grid g4">
-      {kpi("Strategy trades", f'{int(s.get("trades",0))}', "over the window")}
-      {kpi("Buy &amp; hold trades", f'{int(b.get("trades",0))}', "initial purchases only")}
-      {kpi("Extra cost", F_rs(s.get("costs",0)-b.get("costs",0)),
-           f'{(s.get("costs",0)-b.get("costs",0))/1e6*100/5.42:.3f}% of capital a year')}
-      {kpi("Tax paid", F_rs(s.get("tax",0)), "realised, as we go")}
-    </div>
-
-    {callout("Costs are a non-issue; the tax hypothesis was wrong", [
-      "Extra cost is about 0.088% of capital a year. At 0.4 trades per symbol per year there was never room for friction to matter.",
-      "The expectation was that crash exits convert long-term holdings into short-term ones, so drawdown reduction would carry a hidden tax penalty. Only <b>23.3%</b> of sales are short-term — the strategy holds for years between trades.",
-      "And comparing realised tax against buy-and-hold is meaningless, because buy-and-hold never sells and appears to pay nothing. That is deferral, not saving."
-    ], "warn")}
-
-    <h2>Like-for-like, both books liquidated at the final close</h2>
-    <div class="card"><table>
-      <thead><tr><th></th><th class="num">Tax paid as we go</th>
-      <th class="num">Deferred liability</th><th class="num">Total if liquidated</th></tr></thead>
-      <tbody>
-        <tr><td>Strategy</td><td class="num mono">{F_rs(s.get("tax",0))}</td>
-          <td class="num mono">{F_rs(s.get("tax_liquidated",0)-s.get("tax",0))}</td>
-          <td class="num mono cy">{F_rs(s.get("tax_liquidated",0))}</td></tr>
-        <tr><td>Buy &amp; hold</td><td class="num mono">{F_rs(b.get("tax",0))}</td>
-          <td class="num mono">{F_rs(b.get("tax_liquidated",0)-b.get("tax",0))}</td>
-          <td class="num mono cy">{F_rs(b.get("tax_liquidated",0))}</td></tr>
-      </tbody></table></div>
-    <p class="sub" style="margin-top:12px">The strategy pays less tax — but mainly because
-    it earned less, and a smaller gain carries a smaller liability. Lower tax on a lower
-    return is not a benefit, which is why after-tax terminal wealth is the only figure
-    that settles it.</p>
-    """
-
-
-def tab_symbols(d: dict) -> str:
-    t = d["drawdown_table"]
-    if not len(t):
-        return "<p class='sub'>Run phase 8 first.</p>"
-
-    rows = ""
-    for sym, r in t.sort_values("drawdown_saved_pp", ascending=False).iterrows():
-        saved = r["drawdown_saved_pp"]
-        pill = ("<span class='pill ok'>helped</span>" if saved > 0.1 else
-                "<span class='pill no'>hurt</span>" if saved < -0.1 else
-                "<span class='pill dim'>untouched</span>")
-        rows += (
-            f"<tr><td class='mono'><b>{sym}</b></td>"
-            f"<td class='num mono' data-v='{r['strategy_max_drawdown']}'>{r['strategy_max_drawdown']*100:.1f}%</td>"
-            f"<td class='num mono' data-v='{r['bh_max_drawdown']}'>{r['bh_max_drawdown']*100:.1f}%</td>"
-            f"<td class='num mono {F_cls(saved)}' data-v='{saved}'>{saved:+.1f}pp</td>"
-            f"<td class='num mono' data-v='{r['strategy_return']}'>{r['strategy_return']*100:.0f}%</td>"
-            f"<td class='num mono' data-v='{r['bh_return']}'>{r['bh_return']*100:.0f}%</td>"
-            f"<td class='num mono' data-v='{r['exits']}'>{int(r['exits'])}</td>"
-            f"<td class='num mono' data-v='{r['pct_days_in_cash']}'>{r['pct_days_in_cash']:.1f}%</td>"
-            f"<td>{pill}</td></tr>")
-
-    heads = ["Symbol", "Strat DD", "B&amp;H DD", "Saved", "Strat ret", "B&amp;H ret",
-             "Exits", "In cash", "Verdict"]
-    th = "".join(
-        f'<th class="sortable {"num" if i else ""}" onclick="sortTable(this,{i},{str(i>0).lower()})">{h}</th>'
-        for i, h in enumerate(heads))
-
-    return f"""
-    <h2>All {len(t)} symbols</h2>
-    <p class="sub">Click any column to sort. Two-thirds are never traded — that is the
-    dominant fact about this strategy, and sorting by <i>Saved</i> makes it visible
-    immediately.</p>
-    <div class="picker">
-      <input type="search" id="symfilter" placeholder="filter symbols…"
-             oninput="filterSyms(this.value)" style="min-width:220px">
-      <span class="pill dim" id="symcount">{len(t)} shown</span>
-    </div>
-    <div class="card"><div class="scroll"><table id="symtable">
-      <thead><tr>{th}</tr></thead><tbody>{rows}</tbody></table></div></div>
-    """
-
-
-def tab_explorer(d: dict) -> str:
-    syms = sorted(d["symbols"])
-    chips = "".join(f'<div class="chip" onclick="drawExplorer(\'{s}\')" '
-                    f'id="chip-{s}">{s}</div>' for s in syms)
-    opts = "".join(f'<option value="{s}">{s}</option>' for s in syms)
-    return f"""
-    <h2>Symbol explorer</h2>
-    <p class="sub">Price with buy and sell markers, anomaly intensity against the action
-    threshold, and drawdown against buy-and-hold. The shaded bands show periods held in
-    cash — more informative than the markers, because they show what the strategy was
-    holding <i>through</i>.</p>
-    <div class="picker">
-      <select id="symsel" onchange="drawExplorer(this.value)">{opts}</select>
-      <span class="pill dim" id="exp-summary"></span>
-    </div>
-    <div class="chips">{chips}</div>
-    <div class="chart"><h3 id="exp-title">—</h3><div id="exp-price" style="height:340px"></div></div>
-    <div class="chart"><h3>Anomaly intensity</h3><div id="exp-int" style="height:190px"></div></div>
-    <div class="chart"><h3>Drawdown</h3><div id="exp-dd" style="height:230px"></div></div>
-    """
-
-
-def tab_limits(d: dict) -> str:
-    items = [
-        ("No early-warning skill",
-         "Against a random signal of identical firing rate, recall was 0.88x. The 2–3 day prediction requirement is not met. The honest claim is fast reaction, not prediction."),
-        ("Duration is unchanged",
-         "Median sessions under water are identical to buy-and-hold (1,256 either way). The strategy reduces how far you fall, not how long you stay down."),
-        ("Per-stock savings do not aggregate",
-         "ADANIENT saved 17.5pp and ITC 12.0pp, yet the portfolio improved 1.0pp. Stocks trough at different times, and diversification already absorbs most of what the model avoids."),
-        ("The backtest window contains no sharp crash",
-         "The worst drawdown of 2021–2026 was a 154-day slow bleed at 16.5% annualised volatility with one day beyond 3%. There is nothing in it for an anomaly detector to fire on."),
-        ("The stress test rests on a single event",
-         "2020 showed +7.7pp of drawdown saved on a model that never saw COVID. That is one event. Nothing generalises from n=1."),
-        ("Survivorship bias",
-         "The universe is today's NIFTY 100. Companies that fell out of the index are invisible. It inflates the benchmark as much as the strategy, but it is present."),
-        ("Cost and tax rates are unverified",
-         "Built from documented Indian rates but not confirmed against a live contract note, and statutory rates change with each budget."),
-        ("Thresholds are conventional, not optimised",
-         "0.99, 0.95 and 0.90 are round numbers. Optimising them against the hold-out would be a form of look-ahead."),
-    ]
-    cards = "".join(
-        f'<div class="card"><b style="color:var(--warn)">{t}</b>'
-        f'<p style="color:var(--muted);margin:8px 0 0;font-size:13px">{b}</p></div>'
-        for t, b in items)
-
-    return f"""
-    <h2>Known limitations</h2>
-    <p class="sub">Stated in full rather than distributed through footnotes. Most results
-    in this project are narrow or negative, and a dashboard makes it easy to show only
-    the flattering slice.</p>
-    <div class="grid g2">{cards}</div>
-
-    <h2>Defects found during development</h2>
-    <p class="sub">Recorded because the pattern is the most transferable thing here:
-    <b>none of these raised an error, a warning, or an implausible number.</b> Each
-    produced output that looked entirely reasonable and was quietly wrong.</p>
-    <div class="card"><table>
-      <thead><tr><th>#</th><th>Defect</th><th>How it was caught</th></tr></thead>
-      <tbody>
-        <tr><td class="mono cy">1–6</td><td>Six data defects, including a demerger that passes every structural check</td><td>Auditing raw data before writing model code</td></tr>
-        <tr><td class="mono cy">7</td><td>Look-ahead in the inherited regime detector — 9.9% of labels changed once fixed</td><td>Future-perturbation test</td></tr>
-        <tr><td class="mono cy">8</td><td>A crash muting its own signal via a contemporaneous volatility denominator</td><td>Test on real COVID data</td></tr>
-        <tr><td class="mono cy">9</td><td>Double lag in the state machine — every trade delayed a second day</td><td>Test asserting T+1 execution</td></tr>
-        <tr><td class="mono cy">10</td><td>Geometric mean masquerading as a portfolio — understated CAGR by 4.75pp</td><td>Code review</td></tr>
-        <tr><td class="mono cy">11</td><td>EWMA resampling with replacement — 2.63x duplication made recent rows look less anomalous</td><td>Recheck before documenting</td></tr>
-        <tr><td class="mono cy">12</td><td>Scatter chart axis label inverted — said the opposite of the truth</td><td>Looking at the picture</td></tr>
-        <tr><td class="mono cy">13</td><td>Two-thirds of symbols could not fire a signal at all</td><td>Measuring coverage separately from performance</td></tr>
-      </tbody></table></div>
-    """
-
-
-# small server-side formatters used inside f-strings
 def F_pct(v, d=2):
     try:
         return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v*100:.{d}f}%"
@@ -756,38 +380,385 @@ def F_cls(v):
 
 
 # =====================================================================
-# Assembly
+# Tabs -- deliberately plain language
 # =====================================================================
+GLOSSARY = """
+    <div class="card" style="margin-top:18px">
+      <b style="font-size:13px">What the words mean</b>
+      <table style="margin-top:10px">
+        <tbody>
+        <tr><td><b>Anomaly score</b></td><td style="color:var(--muted)">
+          How unusual the day looked to the model. Higher = more unusual.</td></tr>
+        <tr><td><b>Anomaly intensity</b></td><td style="color:var(--muted)">
+          The score turned into a 0&ndash;1 rank. 0.99 means the day was more unusual
+          than 99% of the days the model learned from.</td></tr>
+        <tr><td><b>Slope</b></td><td style="color:var(--muted)">
+          How fast the price is moving, measured in the stock's own typical daily
+          move. &minus;2 means falling twice as fast as a normal day for that stock.</td></tr>
+        <tr><td><b>Acceleration</b></td><td style="color:var(--muted)">
+          Whether the move is speeding up or slowing down. Negative while falling
+          means it is getting worse.</td></tr>
+        <tr><td><b>Drawdown</b></td><td style="color:var(--muted)">
+          How far below its best-ever value the investment currently sits.
+          &minus;20% means you are 20% below the peak.</td></tr>
+        <tr><td><b>Percentage points (pp)</b></td><td style="color:var(--muted)">
+          The plain difference between two percentages. Going from &minus;20% to
+          &minus;18% is an improvement of <b>2 percentage points</b>, not 2%.</td></tr>
+        <tr><td><b>Buy &amp; hold</b></td><td style="color:var(--muted)">
+          Buying on day one and never selling. The benchmark everything is
+          compared against.</td></tr>
+        <tr><td><b>CAGR</b></td><td style="color:var(--muted)">
+          Average yearly growth rate over the whole period.</td></tr>
+        </tbody></table>
+    </div>
+"""
+
+
+def tab_dashboard(d: dict) -> str:
+    t = d["drawdown_table"]
+    cs = d["cost_summary"]
+    traded = int((t["exits"] > 0).sum()) if len(t) else 0
+    untouched = len(t) - traded
+    helped = int((t["drawdown_saved_pp"] > 0.1).sum()) if len(t) else 0
+    hurt = int((t["drawdown_saved_pp"] < -0.1).sum()) if len(t) else 0
+    mean_s = float(t["drawdown_saved_pp"].mean()) if len(t) else 0.0
+    med_s = float(t["drawdown_saved_pp"].median()) if len(t) else 0.0
+
+    kpis = [kpi("Stocks tested", f'{d["n_symbols"]}', f'{d["n_sessions"]} trading days'),
+            kpi("Stocks it traded", f"{traded}", f"{untouched} were never touched", "cy"),
+            kpi("Average drawdown saved", f"{mean_s:+.2f} pts", "across all stocks",
+                "pos" if mean_s > 0 else "neg"),
+            kpi("Typical stock", f"{med_s:+.2f} pts", "the middle stock", "wn")]
+    if len(cs) and "strategy" in cs.index:
+        sr, br = cs.loc["strategy"], cs.loc["buy & hold"]
+        kpis += [kpi("Model yearly return", F_pct(sr.get("cagr_net_all")), "after costs and tax"),
+                 kpi("Buy &amp; hold return", F_pct(br.get("cagr_net_all")), "after costs and tax"),
+                 kpi("Model worst fall", F_pct(sr.get("maxdd")), "peak to trough"),
+                 kpi("Buy &amp; hold worst fall", F_pct(br.get("maxdd")), "peak to trough")]
+
+    return f"""
+    <h2>What this does</h2>
+    <p class="sub">The model holds every stock all the time, and only sells when it
+    spots a day that looks unusual <i>and</i> the price is falling faster and faster.
+    It buys back afterwards. The aim is not to earn more &mdash; it is to fall less
+    when a crash comes.</p>
+    <p class="sub">Learnt from {d["train_window"]}. Tested on {d["window"]}, which the
+    model never saw while learning.</p>
+
+    <div class="grid g4">{"".join(kpis)}</div>
+
+    <h2>How the model decides</h2>
+    <div class="grid g2">
+      <div class="card"><b class="cy">Severe unusual day</b>
+        <p style="color:var(--muted);font-size:13px;margin:8px 0 0">
+        Score in the top 1%. Check whether the price is falling and the fall is
+        speeding up. If yes, <b>sell the next trading day</b>. No waiting &mdash; the
+        advantage disappears within about a day.</p></div>
+      <div class="card"><b class="wn">Mild unusual day</b>
+        <p style="color:var(--muted);font-size:13px;margin:8px 0 0">
+        Score in the top 5% but not the top 1%. Do not sell. <b>Watch for 5 days.</b>
+        Each day compare today's move with the 5-day trend and check the market
+        backdrop. If the fall is speeding up and the backdrop agrees, sell straight
+        away. If the stock turns up, stand down.</p></div>
+    </div>
+
+    <h2>Money over time</h2>
+    <div class="chart"><h3>Portfolio value</h3><div id="pf-eq" style="height:320px"></div></div>
+    <div class="chart"><h3>How far below the peak</h3><div id="pf-dd" style="height:220px"></div></div>
+
+    <h2>Stock by stock</h2>
+    <div class="grid g3">
+      {kpi("Fell less than buy &amp; hold", f"{helped}", "stocks", "pos")}
+      {kpi("Fell more", f"{hurt}", "stocks", "neg")}
+      {kpi("No change", f"{untouched}", "never traded", "dim")}
+    </div>
+    <div class="chart"><h3>Each dot is one stock &mdash; above the line means the model helped</h3>
+      <div id="ov-scatter" style="height:430px"></div></div>
+    {GLOSSARY}
+    """
+
+
+def tab_schemes(d: dict) -> str:
+    sc = d["schemes"]
+    rows = "".join(
+        f"<tr><td><b>{name}</b></td>"
+        f"<td class='num mono'>{r.cagr*100:.2f}%</td>"
+        f"<td class='num mono'>{r.max_drawdown*100:.1f}%</td>"
+        f"<td class='num mono {F_cls(r.drawdown_saved_pp)}'>{r.drawdown_saved_pp:+.1f} pts</td>"
+        f"<td class='num mono'>{r.trades_per_sym_yr:.2f}</td></tr>"
+        for name, r in sc.iterrows()) if len(sc) else ""
+    names = {"rolling": "Last 3 years only",
+             "incremental": "Everything so far",
+             "ewma": "Recent days count more",
+             "vol_purged": "Skip the wildest days"}
+    expl = "".join(
+        f'<tr><td><b>{k}</b></td><td style="color:var(--muted)">{v}</td></tr>'
+        for k, v in names.items())
+
+    return f"""
+    <h2>How often should the model relearn?</h2>
+    <p class="sub">The model is retrained at the start of every month. The only thing
+    that changes between these four is <b>which past data it is allowed to learn from</b>.</p>
+    <div class="card"><table><tbody>{expl}</tbody></table></div>
+
+    <h2>Results</h2>
+    <div class="card"><table>
+      <thead><tr><th>Method</th><th class="num">Yearly return</th>
+      <th class="num">Worst fall</th><th class="num">Better than buy &amp; hold by</th>
+      <th class="num">Trades per stock per year</th></tr></thead>
+      <tbody>{rows}</tbody></table></div>
+
+    {callout("They all perform about the same", [
+      "The gap between best and worst is a fraction of a percentage point &mdash; smaller than the run-to-run noise. Choosing between them is not where the value is.",
+      "What retraining <b>does</b> change is how often the model acts at all. A model trained once on 2016&ndash;2020 barely fires, because that period includes the COVID crash and sets a bar later calm years never reach. Retraining monthly drops that bar to something reachable."
+    ])}
+    <div class="imgwrap"><img src="data:image/png;base64,{d['img_schemes']}" alt="by method"></div>
+    """
+
+
+def tab_portfolio(d: dict) -> str:
+    cs = d["cost_summary"]
+    if not len(cs):
+        return "<p class='sub'>Run the pipeline first.</p>"
+    s_, b_ = cs.loc["strategy"], cs.loc["buy & hold"]
+    return f"""
+    <h2>What trading actually costs</h2>
+    <p class="sub">Every trade pays brokerage, securities transaction tax, stamp duty,
+    GST and the gap between the price you wanted and the price you got. Selling also
+    triggers capital gains tax.</p>
+    <div class="grid g4">
+      {kpi("Model trades", f'{int(s_.get("trades",0))}', "over the whole period")}
+      {kpi("Buy &amp; hold trades", f'{int(b_.get("trades",0))}', "one purchase each")}
+      {kpi("Extra cost of trading", F_rs(s_.get("costs",0)-b_.get("costs",0)), "over the period")}
+      {kpi("Tax paid", F_rs(s_.get("tax",0)), "on gains taken")}
+    </div>
+
+    <h2>Comparing tax fairly</h2>
+    <p class="sub">Buy &amp; hold never sells, so it looks like it pays no tax at all.
+    That is not a saving &mdash; the tax is still owed, just later. To compare fairly,
+    both are sold at the end of the period.</p>
+    <div class="card"><table>
+      <thead><tr><th></th><th class="num">Tax paid along the way</th>
+      <th class="num">Tax still owed</th><th class="num">Total</th></tr></thead>
+      <tbody>
+        <tr><td>Model</td><td class="num mono">{F_rs(s_.get("tax",0))}</td>
+          <td class="num mono">{F_rs(s_.get("tax_liquidated",0)-s_.get("tax",0))}</td>
+          <td class="num mono cy">{F_rs(s_.get("tax_liquidated",0))}</td></tr>
+        <tr><td>Buy &amp; hold</td><td class="num mono">{F_rs(b_.get("tax",0))}</td>
+          <td class="num mono">{F_rs(b_.get("tax_liquidated",0)-b_.get("tax",0))}</td>
+          <td class="num mono cy">{F_rs(b_.get("tax_liquidated",0))}</td></tr>
+      </tbody></table></div>
+    """
+
+
+def tab_symbols(d: dict) -> str:
+    t = d["drawdown_table"]
+    if not len(t):
+        return "<p class='sub'>Run the pipeline first.</p>"
+    rows = ""
+    for sym, r in t.sort_values("drawdown_saved_pp", ascending=False).iterrows():
+        sv = r["drawdown_saved_pp"]
+        pill = ("<span class='pill ok'>fell less</span>" if sv > 0.1 else
+                "<span class='pill no'>fell more</span>" if sv < -0.1 else
+                "<span class='pill dim'>not traded</span>")
+        rows += (f"<tr><td class='mono'><b>{sym}</b></td>"
+                 f"<td class='num mono' data-v='{r['strategy_max_drawdown']}'>{r['strategy_max_drawdown']*100:.1f}%</td>"
+                 f"<td class='num mono' data-v='{r['bh_max_drawdown']}'>{r['bh_max_drawdown']*100:.1f}%</td>"
+                 f"<td class='num mono {F_cls(sv)}' data-v='{sv}'>{sv:+.1f}</td>"
+                 f"<td class='num mono' data-v='{r['strategy_return']}'>{r['strategy_return']*100:.0f}%</td>"
+                 f"<td class='num mono' data-v='{r['bh_return']}'>{r['bh_return']*100:.0f}%</td>"
+                 f"<td class='num mono' data-v='{r['exits']}'>{int(r['exits'])}</td>"
+                 f"<td>{pill}</td></tr>")
+    heads = ["Stock", "Model worst fall", "Buy &amp; hold worst fall",
+             "Points better", "Model return", "Buy &amp; hold return", "Sells", ""]
+    th = "".join(f'<th class="sortable {"num" if i else ""}" '
+                 f'onclick="sortTable(this,{i},{str(i>0).lower()})">{h}</th>'
+                 for i, h in enumerate(heads))
+    return f"""
+    <h2>Every stock</h2>
+    <p class="sub">Click a column to sort. &ldquo;Points better&rdquo; is how much
+    shallower the model's worst fall was, in percentage points.</p>
+    <div class="picker">
+      <input type="search" id="symfilter" placeholder="find a stock…"
+             oninput="filterSyms(this.value)" style="min-width:220px">
+      <span class="pill dim" id="symcount">{len(t)} shown</span>
+    </div>
+    <div class="card"><div class="scroll"><table id="symtable">
+      <thead><tr>{th}</tr></thead><tbody>{rows}</tbody></table></div></div>
+    """
+
+
+def tab_explorer(d: dict) -> str:
+    syms = sorted(d["symbols"])
+    opts = "".join(f'<option value="{s}">{s}</option>' for s in syms)
+    chips = "".join(f'<div class="chip" onclick="drawExplorer(\'{s}\')" id="chip-{s}">{s}</div>'
+                    for s in syms)
+    return f"""
+    <h2>One stock at a time</h2>
+    <div class="picker">
+      <select id="symsel" onchange="drawExplorer(this.value)">{opts}</select>
+      <span class="pill dim" id="exp-summary"></span>
+    </div>
+    <div class="chips">{chips}</div>
+    <div class="chart"><h3 id="exp-title">&mdash;</h3><div id="exp-price" style="height:330px"></div></div>
+    <div class="chart"><h3>How unusual each day looked (1.0 = most unusual)</h3>
+      <div id="exp-int" style="height:180px"></div></div>
+    <div class="chart"><h3>How far below the peak</h3><div id="exp-dd" style="height:220px"></div></div>
+
+    <h2>Every unusual day for this stock</h2>
+    <p class="sub">Only days the model flagged are listed. <b>Severe</b> means the top 1%
+    of unusual days &mdash; the model sells the next day if price is falling and the
+    fall is speeding up. <b>Mild</b> means the top 5% &mdash; the model watches for
+    5 days instead of acting.</p>
+    <div class="card"><div class="scroll"><table id="anomtable">
+      <thead><tr>
+        <th>Date</th><th class="num">Anomaly score</th><th class="num">Intensity</th>
+        <th>Severity</th><th class="num">Move that day</th><th class="num">Slope</th>
+        <th class="num">Acceleration</th><th>Trend</th><th>Market regime</th>
+        <th>Action taken</th>
+      </tr></thead><tbody id="anombody"></tbody></table></div></div>
+    {GLOSSARY}
+    """
+
+
+JS_CHARTS = """
+// ---------- portfolio ----------
+(function(){
+  const p=DATA.portfolio; if(!p||!p.strategy) return;
+  Plotly.newPlot('pf-eq',[
+    {x:p.buy_hold.dates,y:p.buy_hold.equity,name:'buy & hold',type:'scatter',mode:'lines',
+     line:{color:'#64748B',width:1.6}},
+    {x:p.strategy.dates,y:p.strategy.equity,name:'model',type:'scatter',mode:'lines',
+     line:{color:'#00E5FF',width:1.8}}
+  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickprefix:'₹'}},CFGP);
+
+  Plotly.newPlot('pf-dd',[
+    {x:p.buy_hold.dates,y:p.buy_hold.drawdown,name:'buy & hold',type:'scatter',
+     fill:'tozeroy',mode:'lines',line:{color:'#64748B',width:1},
+     fillcolor:'rgba(100,116,139,.28)'},
+    {x:p.strategy.dates,y:p.strategy.drawdown,name:'model',type:'scatter',mode:'lines',
+     line:{color:'#00E5FF',width:1.6}}
+  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickformat:'.0%'}},CFGP);
+})();
+
+// ---------- scatter ----------
+(function(){
+  const s=DATA.scatter; if(!s||!s.length) return;
+  const helped=s.filter(d=>d.y-d.x>0.001), hurt=s.filter(d=>d.y-d.x<-0.001),
+        flat=s.filter(d=>Math.abs(d.y-d.x)<=0.001);
+  const lo=Math.min(...s.map(d=>Math.min(d.x,d.y)))*1.05;
+  const mk=(a,n,c)=>({x:a.map(d=>d.x),y:a.map(d=>d.y),text:a.map(d=>d.s),
+    name:n+' ('+a.length+')',mode:'markers',type:'scatter',
+    marker:{size:9,color:c,opacity:.85},
+    hovertemplate:'%{text}<br>buy & hold %{x:.1%}<br>model %{y:.1%}<extra></extra>'});
+  Plotly.newPlot('ov-scatter',[
+    {x:[lo,0],y:[lo,0],mode:'lines',line:{color:'#475569',dash:'dash',width:1},
+     name:'same',hoverinfo:'skip'},
+    mk(flat,'not traded','#64748B'),mk(helped,'fell less','#34D399'),mk(hurt,'fell more','#F87171')
+  ],{...LAYOUT,hovermode:'closest',
+     xaxis:{...LAYOUT.xaxis,title:'buy & hold worst fall',tickformat:'.0%'},
+     yaxis:{...LAYOUT.yaxis,title:'model worst fall',tickformat:'.0%'}},CFGP);
+})();
+
+// ---------- one stock ----------
+function drawExplorer(sym){
+  const s=DATA.symbols[sym]; if(!s) return;
+  document.getElementById('symsel').value=sym;
+  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+  const chip=document.getElementById('chip-'+sym); if(chip)chip.classList.add('active');
+
+  const cash=1-s.held.reduce((a,b)=>a+b,0)/s.held.length;
+  document.getElementById('exp-summary').textContent=
+    s.sells.length+' sells · '+s.buys.length+' buys · '+(cash*100).toFixed(1)+'% of days out of the market';
+  const worst=a=>a.reduce((m,v)=>Math.min(m,v),0);
+  document.getElementById('exp-title').textContent=
+    sym+' — model worst fall '+F.pct(worst(s.dd_strategy))+
+    ', buy & hold '+F.pct(worst(s.dd_bench));
+
+  const shapes=[]; let start=null;
+  for(let i=0;i<s.held.length;i++){
+    if(!s.held[i]&&start===null)start=s.dates[i];
+    if((s.held[i]||i===s.held.length-1)&&start!==null){
+      shapes.push({type:'rect',xref:'x',yref:'paper',x0:start,x1:s.dates[i],y0:0,y1:1,
+        fillcolor:'rgba(248,113,113,.13)',line:{width:0},layer:'below'});
+      start=null;
+    }
+  }
+  const at=ds=>ds.map(d=>s.close[s.dates.indexOf(d)]);
+  Plotly.newPlot('exp-price',[
+    {x:s.dates,y:s.close,type:'scatter',mode:'lines',name:'price',
+     line:{color:'#E2E8F0',width:1.3}},
+    {x:s.sells,y:at(s.sells),mode:'markers',name:'sell',
+     marker:{symbol:'triangle-down',size:11,color:'#F87171'}},
+    {x:s.buys,y:at(s.buys),mode:'markers',name:'buy',
+     marker:{symbol:'triangle-up',size:11,color:'#34D399'}}
+  ],{...LAYOUT,shapes},CFGP);
+
+  Plotly.newPlot('exp-int',[
+    {x:s.dates,y:s.intensity,type:'scatter',mode:'lines',name:'how unusual',
+     line:{color:'#A78BFA',width:1.1}}
+  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,range:[0,1.02]},
+     shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:0.99,y1:0.99,
+       line:{color:'#F87171',dash:'dash',width:1.2}}]},CFGP);
+
+  // ---- the anomaly-day table ----
+  const tb=document.getElementById('anombody');
+  if(tb){
+    const cls=v=>v>0?'pos':(v<0?'neg':'');
+    tb.innerHTML=(s.anomalies||[]).map(a=>
+      '<tr><td class="mono">'+a.date+'</td>'+
+      '<td class="num mono">'+(a.score==null?'—':a.score.toFixed(4))+'</td>'+
+      '<td class="num mono">'+a.intensity.toFixed(4)+'</td>'+
+      '<td><span class="pill '+(a.severity==='Severe'?'no':'mid')+'">'+a.severity+'</span></td>'+
+      '<td class="num mono '+cls(a.ret)+'">'+(a.ret==null?'—':a.ret.toFixed(2)+'%')+'</td>'+
+      '<td class="num mono '+cls(a.slope)+'">'+a.slope.toFixed(2)+'</td>'+
+      '<td class="num mono '+cls(a.accel)+'">'+a.accel.toFixed(2)+'</td>'+
+      '<td style="color:var(--muted)">'+a.trend+'</td>'+
+      '<td style="color:var(--muted)">'+a.regime+'</td>'+
+      '<td>'+(a.action.indexOf('SELL')>=0?'<span class="pill no">'+a.action+'</span>'
+             :a.action==='BUY'?'<span class="pill ok">BUY</span>'
+             :'<span class="pill dim">'+a.action+'</span>')+'</td></tr>').join('')
+      || '<tr><td colspan="10" style="color:var(--muted)">No unusual days for this stock.</td></tr>';
+  }
+
+  Plotly.newPlot('exp-dd',[
+    {x:s.dates,y:s.dd_bench,type:'scatter',fill:'tozeroy',mode:'lines',name:'buy & hold',
+     line:{color:'#64748B',width:1},fillcolor:'rgba(100,116,139,.28)'},
+    {x:s.dates,y:s.dd_strategy,type:'scatter',mode:'lines',name:'model',
+     line:{color:'#00E5FF',width:1.6}}
+  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickformat:'.0%'}},CFGP);
+}
+
+function filterSyms(q){
+  q=q.trim().toUpperCase();
+  let n=0;
+  document.querySelectorAll('#symtable tbody tr').forEach(r=>{
+    const hit=r.cells[0].textContent.toUpperCase().includes(q);
+    r.style.display=hit?'':'none'; if(hit)n++;
+  });
+  document.getElementById('symcount').textContent=n+' shown';
+}
+"""
+
+
 def build(d: dict) -> str:
     payload = {
         "symbols": d["symbols"],
         "portfolio": d["portfolio"],
-        "scatter": [
-            {"s": s, "x": float(r["bh_max_drawdown"]), "y": float(r["strategy_max_drawdown"]),
-             "e": int(r["exits"])}
-            for s, r in d["drawdown_table"].iterrows()
-        ] if len(d["drawdown_table"]) else [],
-        "horizon": d["horizon"].to_dict("records") if len(d["horizon"]) else [],
-        "decay": d["decay"].to_dict("records") if len(d["decay"]) else [],
+        "scatter": [{"s": s, "x": float(r["bh_max_drawdown"]),
+                     "y": float(r["strategy_max_drawdown"]), "e": int(r["exits"])}
+                    for s, r in d["drawdown_table"].iterrows()] if len(d["drawdown_table"]) else [],
     }
-
-    tabs = [
-        ("overview", "Overview", tab_overview(d)),
-        ("data", "Data Quality", tab_data(d)),
-        ("detection", "Detection", tab_detection(d)),
-        ("schemes", "Retraining", tab_schemes(d)),
-        ("portfolio", "Costs &amp; Tax", tab_portfolio(d)),
-        ("symbols", "All Symbols", tab_symbols(d)),
-        ("explorer", "Explorer", tab_explorer(d)),
-        ("limits", "Limitations", tab_limits(d)),
-    ]
-    buttons = "".join(
-        f'<button class="tab{" active" if i == 0 else ""}" onclick="tab(\'{k}\',this)">{lab}</button>'
-        for i, (k, lab, _) in enumerate(tabs))
-    panels = "".join(
-        f'<div class="panel{" active" if i == 0 else ""}" id="{k}">{body}</div>'
-        for i, (k, _, body) in enumerate(tabs))
-
+    tabs = [("dashboard", "Dashboard", tab_dashboard(d)),
+            ("schemes", "Retraining", tab_schemes(d)),
+            ("portfolio", "Costs &amp; Tax", tab_portfolio(d)),
+            ("symbols", "All Stocks", tab_symbols(d)),
+            ("explorer", "Stock Deep Dive", tab_explorer(d))]
+    buttons = "".join(f'<button class="tab{" active" if i==0 else ""}" '
+                      f'onclick="tab(\'{k}\',this)">{lab}</button>'
+                      for i, (k, lab, _) in enumerate(tabs))
+    panels = "".join(f'<div class="panel{" active" if i==0 else ""}" id="{k}">{body}</div>'
+                     for i, (k, _, body) in enumerate(tabs))
     first = sorted(d["symbols"])[0] if d["symbols"] else ""
 
     return f"""<!doctype html>
@@ -799,154 +770,22 @@ def build(d: dict) -> str:
 <style>{CSS}</style></head>
 <body>
 <header><div class="wrap">
-  <div class="brand">
-    <h1>QBEAST <span class="accent">·</span> Crash Detection</h1>
-    <span class="tagline">Isolation Forest anomaly detection on Indian equities</span>
-  </div>
-  <div class="meta">
-    <span>{d['n_symbols']} symbols</span><span>{d['n_sessions']} sessions</span>
-    <span>trained {d['train_window']}</span><span>tested {d['window']}</span>
-    <span>generated {d['generated']}</span>
-  </div>
+  <div class="brand"><h1>QBEAST <span class="accent">·</span> Crash Detection</h1>
+    <span class="tagline">Spotting unusual days in Indian stocks, to sell before a fall deepens</span></div>
+  <div class="meta"><span>{d['n_symbols']} stocks</span><span>{d['n_sessions']} trading days</span>
+    <span>learnt {d['train_window']}</span><span>tested {d['window']}</span>
+    <span>generated {d['generated']}</span></div>
   <div class="tabs">{buttons}</div>
 </div></header>
 <div class="wrap">{panels}
-<footer>QBEAST · Isolation Forest crash detection · generated {d['generated']} ·
-all figures out-of-sample unless stated</footer>
-</div>
+<footer>QBEAST · generated {d['generated']} · every figure is from the test period,
+which the model never saw while learning</footer></div>
 <script>
 const DATA={json.dumps(payload, separators=(",", ":"))};
 const EXP_SYMBOL={json.dumps(first)};
 {JS_HELPERS}
 {JS_CHARTS}
 </script></body></html>"""
-
-
-JS_CHARTS = """
-// ---------- portfolio ----------
-(function(){
-  const p=DATA.portfolio; if(!p.strategy) return;
-  Plotly.newPlot('pf-eq',[
-    {x:p.buy_hold.dates,y:p.buy_hold.equity,name:'buy & hold',type:'scatter',mode:'lines',
-     line:{color:'#64748B',width:1.6}},
-    {x:p.strategy.dates,y:p.strategy.equity,name:'strategy',type:'scatter',mode:'lines',
-     line:{color:'#00E5FF',width:1.8}}
-  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickprefix:'₹'}},CFGP);
-
-  Plotly.newPlot('pf-dd',[
-    {x:p.buy_hold.dates,y:p.buy_hold.drawdown,name:'buy & hold',type:'scatter',
-     fill:'tozeroy',mode:'lines',line:{color:'#64748B',width:1},
-     fillcolor:'rgba(100,116,139,.28)'},
-    {x:p.strategy.dates,y:p.strategy.drawdown,name:'strategy',type:'scatter',mode:'lines',
-     line:{color:'#00E5FF',width:1.6}}
-  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickformat:'.0%'}},CFGP);
-})();
-
-// ---------- scatter ----------
-(function(){
-  const s=DATA.scatter; if(!s.length) return;
-  const g=(f)=>s.filter(f);
-  const helped=g(d=>d.y-d.x>0.001), hurt=g(d=>d.y-d.x<-0.001),
-        flat=g(d=>Math.abs(d.y-d.x)<=0.001);
-  const lo=Math.min(...s.map(d=>Math.min(d.x,d.y)))*1.05;
-  const mk=(arr,name,col)=>({x:arr.map(d=>d.x),y:arr.map(d=>d.y),text:arr.map(d=>d.s),
-    name:name+' ('+arr.length+')',mode:'markers',type:'scatter',
-    marker:{size:8,color:col,opacity:.85},
-    hovertemplate:'%{text}<br>B&H %{x:.1%}<br>strategy %{y:.1%}<extra></extra>'});
-  Plotly.newPlot('ov-scatter',[
-    {x:[lo,0],y:[lo,0],mode:'lines',line:{color:'#475569',dash:'dash',width:1},
-     name:'no change',hoverinfo:'skip'},
-    mk(flat,'unchanged','#64748B'),mk(helped,'shallower','#34D399'),mk(hurt,'deeper','#F87171')
-  ],{...LAYOUT,hovermode:'closest',
-     xaxis:{...LAYOUT.xaxis,title:'buy & hold max drawdown',tickformat:'.0%'},
-     yaxis:{...LAYOUT.yaxis,title:'strategy max drawdown',tickformat:'.0%'}},CFGP);
-})();
-
-// ---------- lift decay ----------
-(function(){
-  const h=DATA.horizon; if(!h.length) return;
-  Plotly.newPlot('det-lift',[
-    {x:h.map(r=>r.horizon),y:h.map(r=>r.lift),type:'scatter',mode:'lines+markers',
-     name:'lift',line:{color:'#00E5FF',width:2.4},marker:{size:8},
-     hovertemplate:'H=%{x}d<br>%{y:.1f}x<extra></extra>'}
-  ],{...LAYOUT,hovermode:'closest',
-     xaxis:{...LAYOUT.xaxis,title:'horizon (trading days)'},
-     yaxis:{...LAYOUT.yaxis,title:'lift over base rate',type:'log'}},CFGP);
-})();
-
-// ---------- decay sweep ----------
-(function(){
-  const d=DATA.decay; if(!d.length) return;
-  Plotly.newPlot('sc-decay',[
-    {x:d.map(r=>r.eff_years),y:d.map(r=>r.dd_saved_pp),type:'scatter',
-     mode:'lines+markers',line:{color:'#A78BFA',width:2.2},marker:{size:9},
-     text:d.map(r=>'decay '+r.decay.toFixed(4)),
-     hovertemplate:'%{text}<br>memory %{x:.2f}y<br>saved %{y:+.2f}pp<extra></extra>'}
-  ],{...LAYOUT,hovermode:'closest',
-     xaxis:{...LAYOUT.xaxis,title:'effective memory (years)'},
-     yaxis:{...LAYOUT.yaxis,title:'drawdown saved (pp)'}},CFGP);
-})();
-
-// ---------- explorer ----------
-function drawExplorer(sym){
-  const s=DATA.symbols[sym]; if(!s) return;
-  document.getElementById('symsel').value=sym;
-  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
-  const chip=document.getElementById('chip-'+sym); if(chip)chip.classList.add('active');
-
-  const cash=1-s.held.reduce((a,b)=>a+b,0)/s.held.length;
-  document.getElementById('exp-summary').textContent=
-    s.sells.length+' sells · '+s.buys.length+' buys · '+(cash*100).toFixed(1)+'% of days in cash';
-  document.getElementById('exp-title').textContent=
-    sym+' — strategy '+F.pct(s.dd_strategy.reduce((m,v)=>Math.min(m,v),0))+
-    ' max DD vs buy & hold '+F.pct(s.dd_bench.reduce((m,v)=>Math.min(m,v),0));
-
-  // shade every stretch held in cash
-  const shapes=[]; let start=null;
-  for(let i=0;i<s.held.length;i++){
-    if(!s.held[i]&&start===null)start=s.dates[i];
-    if((s.held[i]||i===s.held.length-1)&&start!==null){
-      shapes.push({type:'rect',xref:'x',yref:'paper',x0:start,x1:s.dates[i],y0:0,y1:1,
-        fillcolor:'rgba(248,113,113,.13)',line:{width:0},layer:'below'});
-      start=null;
-    }
-  }
-  const at=(ds)=>ds.map(d=>s.close[s.dates.indexOf(d)]);
-  Plotly.newPlot('exp-price',[
-    {x:s.dates,y:s.close,type:'scatter',mode:'lines',name:'close',
-     line:{color:'#E2E8F0',width:1.3}},
-    {x:s.sells,y:at(s.sells),mode:'markers',name:'sell',
-     marker:{symbol:'triangle-down',size:11,color:'#F87171'}},
-    {x:s.buys,y:at(s.buys),mode:'markers',name:'buy',
-     marker:{symbol:'triangle-up',size:11,color:'#34D399'}}
-  ],{...LAYOUT,shapes},CFGP);
-
-  Plotly.newPlot('exp-int',[
-    {x:s.dates,y:s.intensity,type:'scatter',mode:'lines',name:'intensity',
-     line:{color:'#A78BFA',width:1.1}}
-  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,range:[0,1.02]},
-     shapes:[{type:'line',xref:'paper',x0:0,x1:1,y0:0.99,y1:0.99,
-       line:{color:'#F87171',dash:'dash',width:1.2}}]},CFGP);
-
-  Plotly.newPlot('exp-dd',[
-    {x:s.dates,y:s.dd_bench,type:'scatter',fill:'tozeroy',mode:'lines',name:'buy & hold',
-     line:{color:'#64748B',width:1},fillcolor:'rgba(100,116,139,.28)'},
-    {x:s.dates,y:s.dd_strategy,type:'scatter',mode:'lines',name:'strategy',
-     line:{color:'#00E5FF',width:1.6}}
-  ],{...LAYOUT,yaxis:{...LAYOUT.yaxis,tickformat:'.0%'}},CFGP);
-}
-
-function filterSyms(q){
-  q=q.trim().toUpperCase();
-  const rows=document.querySelectorAll('#symtable tbody tr');
-  let n=0;
-  rows.forEach(r=>{
-    const hit=r.cells[0].textContent.toUpperCase().includes(q);
-    r.style.display=hit?'':'none'; if(hit)n++;
-  });
-  document.getElementById('symcount').textContent=n+' shown';
-}
-"""
 
 
 def main() -> int:

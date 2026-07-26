@@ -61,6 +61,7 @@ from qbeast_crash.regime import detect_regimes, realized_hv
 from qbeast_crash.retrain import SCHEMES, SchemeResult, walk_forward
 from qbeast_crash.signals import (
     ReentryRule,
+    is_sell,
     SignalConfig,
     equal_weight_equity,
     generate_signals,
@@ -211,6 +212,7 @@ def phase_3(ctx: dict) -> dict:
 
     intensity = detector.intensity(features)
     scored = features.assign(
+        anomaly_score=detector.raw_score(features),
         intensity=intensity,
         band=detector.band(intensity),
     )
@@ -229,8 +231,8 @@ def phase_3(ctx: dict) -> dict:
     scored = scored.assign(regime=regime_long.reindex(scored.index))
 
     detector.save(MODELS / "detector_baseline.pkl")
-    scored[["intensity", "band", "slope_z", "accel_z", "phase", "regime",
-            "ret_1d", "vol"]].to_parquet(
+    scored[["anomaly_score", "intensity", "band", "slope_z", "accel_z", "phase",
+            "regime", "ret_1d", "vol"]].to_parquet(
         DATA_PROCESSED / "intensity.parquet"
     )
 
@@ -420,7 +422,7 @@ def phase_5(ctx: dict) -> dict:
                 continue
             sig = generate_signals(sub, cfg, reentry=rule)
             pos[sym] = sig["in_position"].reindex(oos, fill_value=True)
-            n_trades += int((sig["action"] == "EXIT").sum())
+            n_trades += int(is_sell(sig["action"]).sum())
 
         pos_panel = pd.DataFrame(pos).reindex(columns=ret_panel.columns, fill_value=True)
         cols = ret_panel.columns.intersection(pos_panel.columns)
@@ -475,7 +477,7 @@ def phase_5(ctx: dict) -> dict:
                 continue
             sg = generate_signals(sub, cfg, reentry=best)
             pos[sym] = sg["in_position"].reindex(win, fill_value=True)
-            n_tr += int((sg["action"] == "EXIT").sum())
+            n_tr += int(is_sell(sg["action"]).sum())
 
         rp = pd.DataFrame(
             {s: f["close"].astype(float).pct_change() for s, f in frames.items()}
@@ -650,7 +652,7 @@ def phase_6(ctx: dict) -> dict:
             ret = prices[sym].pct_change().fillna(0.0)
             bh = (1 + ret).cumprod().iloc[-1]
             st = (1 + ret * sub["in_position"].astype(float)).cumprod().iloc[-1]
-            contrib.append((sym, (st - bh) * 100, int((sub["action"] == "EXIT").sum())))
+            contrib.append((sym, (st - bh) * 100, int(is_sell(sub["action"]).sum())))
         contrib.sort(key=lambda x: -abs(x[1]))
         total = sum(abs(c[1]) for c in contrib) or 1.0
         untraded = sum(1 for c in contrib if c[2] == 0)
@@ -718,7 +720,7 @@ def phase_7(ctx: dict) -> dict:
             sig = generate_signals(sub, CFG.signals, reentry=ctx.get("reentry_rule", "time"))
             pos[sym] = sig["in_position"].reindex(oos, fill_value=True)
             sig_by_symbol[sym] = sig
-            n_exits += int((sig["action"] == "EXIT").sum())
+            n_exits += int(is_sell(sig["action"]).sum())
 
         pos_panel = pd.DataFrame(pos).reindex(columns=ret_panel.columns, fill_value=True)
         cols = ret_panel.columns.intersection(pos_panel.columns)
@@ -779,8 +781,8 @@ def phase_7(ctx: dict) -> dict:
     print(f"\nCOVERAGE -- symbols the scheme actually traded")
     print(f"{'scheme':14s}{'traded':>10s}{'of':>4s}{'exits':>9s}{'per sym/yr':>13s}")
     for scheme, sigs in scheme_signals.items():
-        traded = sum(1 for s_ in sigs.values() if (s_["action"] == "EXIT").any())
-        tot = sum(int((s_["action"] == "EXIT").sum()) for s_ in sigs.values())
+        traded = sum(1 for s_ in sigs.values() if is_sell(s_["action"]).any())
+        tot = sum(int(is_sell(s_["action"]).sum()) for s_ in sigs.values())
         print(f"{scheme:14s}{traded:10d}{len(frames):4d}{tot:9d}"
               f"{tot / max(len(frames), 1) / years:13.2f}")
 
@@ -818,7 +820,7 @@ def phase_7(ctx: dict) -> dict:
             eq = (1 + r_ * held.astype(float)).cumprod()
             row[f"{k}_max_dd"] = drawdown_stats(eq).max_drawdown
             row[f"{k}_return"] = eq.iloc[-1] - 1
-            row[f"{k}_exits"] = int((sig["action"] == "EXIT").sum())
+            row[f"{k}_exits"] = int(is_sell(sig["action"]).sum())
         rows.append(row)
     per_stock = pd.DataFrame(rows).set_index("symbol")
     per_stock.to_csv(REPORTS / "phase7_drawdown_by_symbol_by_scheme.csv")
@@ -882,7 +884,7 @@ def phase_8(ctx: dict) -> dict:
             "bh_longest_underwater": b_dd.longest_underwater,
             "time_to_recover": s_dd.time_to_recover,
             "bh_time_to_recover": b_dd.time_to_recover,
-            "exits": int((sig["action"] == "EXIT").sum()),
+            "exits": int(is_sell(sig["action"]).sum()),
             "pct_days_in_cash": 100 * (1 - held.mean()),
         })
 
