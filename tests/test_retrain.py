@@ -84,6 +84,40 @@ def test_ewma_weights_recent_data_more_heavily():
     assert drawn.to_series().median() > available.to_series().median()
 
 
+def test_ewma_sampling_draws_no_duplicates():
+    """
+    Regression guard for a real defect.
+
+    Drawing WITH replacement produced 2.63x duplication -- 100,000 rows for
+    only 38,043 unique ones. Duplicates are not neutral here: identical points
+    cannot be separated from each other, so a tree stops splitting and their
+    path length inflates, scoring them as LESS anomalous. That would
+    systematically under-flag exactly the recent rows EWMA exists to emphasise.
+    """
+    f = _features(periods=2000, n_sym=8)
+    rows, _ = training_slice(f, pd.Timestamp("2021-06-01"), "ewma",
+                             DEFAULT_CONFIG, rng=np.random.default_rng(0))
+    assert len(rows) == len(rows.index.unique()), "EWMA resampling drew duplicates"
+
+
+def test_ewma_memory_is_shorter_than_the_rolling_window():
+    """
+    Worth asserting because it is easy to assume otherwise: decay 0.994 implies
+    a half-life of 115 sessions and an effective sample of 167 -- about 0.66
+    years, against the rolling scheme's 3. The schemes differ in LOOKBACK as
+    well as in weighting.
+    """
+    f = _features(periods=2000, n_sym=8)
+    as_of = pd.Timestamp("2021-06-01")
+    ewma, _ = training_slice(f, as_of, "ewma", DEFAULT_CONFIG,
+                             rng=np.random.default_rng(0))
+    roll, _ = training_slice(f, as_of, "rolling", DEFAULT_CONFIG)
+
+    ewma_age = pd.Series((as_of - ewma.index.get_level_values("date")).days).median()
+    roll_age = pd.Series((as_of - roll.index.get_level_values("date")).days).median()
+    assert ewma_age < roll_age
+
+
 def test_vol_purge_excludes_turbulent_dates():
     f = _features()
     dates = _calendar(f)

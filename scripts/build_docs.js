@@ -1460,6 +1460,162 @@ const PHASES = {
       return c;
     },
   },
+
+  phase7: {
+    slug: "Phase7_Retraining_Comparison",
+    docTitle: "QBEAST Phase 7 - Retraining Scheme Comparison",
+    runningHead: "QBEAST \u00b7 Phase 7 - Retraining",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 7",
+        title: "Retraining Comparison",
+        subtitle: "Four rules for choosing training data, measured walk-forward",
+        status: "STATUS: COMPLETE - 168 tests passing",
+        meta: [
+          "66 monthly refits x 4 schemes, 126,728 scored symbol-days each",
+          "Spread across all four schemes: 0.2pp of drawdown",
+          "A defect in the EWMA implementation found and fixed on recheck",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      // ------------------------------------------------------- 1
+      c.push(
+        H1("1. Why refit at all"),
+        P("Phase 3 fitted the detector once on 2016-2020 and scored five years forward. That is not how the system would run. A live model is refitted as data arrives, and the question this phase answers is which rule for choosing that data produces the shallowest drawdown."),
+
+        H2("1.1 The four schemes"),
+        Tbl(["Scheme", "Training set at each refit", "Rationale"], [
+          ["rolling", "Trailing 3 years", "Forgets old regimes entirely - 2016 volatility is not evidence about 2025"],
+          ["incremental", "Everything since the start", "Longest memory, adapts slowest, accumulates every past crisis"],
+          ["ewma", "Exponentially weighted by age, decay 0.994", "Old days fade rather than being cut off"],
+          ["vol_purged", "Rolling, minus the most turbulent decile of days", "Isolation Forest learns normal from what it sees; crises in training make crises unremarkable"],
+        ], [1700, 3100, 4200]),
+
+        H2("1.2 The experiment varies one thing"),
+        P("All four refit on the SAME schedule -- the first session of each month. Only the training set differs. Varying the refit frequency at the same time would confound the two effects and neither could be attributed to anything."),
+
+        H2("1.3 Why the comparison is valid at all"),
+        RichP([
+          { text: "Because intensity is a percentile of each fit's OWN training distribution rather than a raw anomaly score. That decision was taken in Phase 3 " },
+          { text: "specifically", italics: true },
+          { text: " to make this phase possible." },
+        ]),
+        P("The raw score's scale shifts with the training window and with whichever random trees happened to be built. A fixed cut on it would select a different fraction of days under each scheme, so the benchmark would be measuring the scoring scale rather than the schemes it claims to compare. With a percentile, 0.99 means the same thing under all four."),
+
+        H2("1.4 Walk-forward, verified"),
+        P("At each refit the model sees data strictly before that date, and scores only the days until the next refit. No day is ever scored by a model that has seen it. A future-perturbation test enforces this: rewrite the tail of the data and every earlier intensity must be unchanged."),
+        P("Block coverage was checked directly -- all 1,344 sessions of the backtest window are scored exactly once, with no gaps and no overlaps."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 2
+      c.push(
+        H1("2. The result"),
+        Tbl(["Scheme", "CAGR", "maxDD", "vs B&H", "Trades/sym/yr", "Efficiency"], [
+          ["buy & hold", "25.64%", "-20.0%", "--", "0.00", "--"],
+          ["rolling", "25.56%", "-19.6%", "+0.4pp", "0.35", "1.1"],
+          ["incremental", "25.82%", "-19.8%", "+0.2pp", "0.28", "0.7"],
+          ["ewma", "25.78%", "-19.6%", "+0.4pp", "0.32", "1.1"],
+          ["vol_purged", "25.40%", "-19.6%", "+0.3pp", "0.64", "0.5"],
+        ], [1900, 1400, 1400, 1400, 1500, 1400]),
+        P("Efficiency is drawdown saved per unit of turnover. Ranking on it rather than on raw return is deliberate: a scheme that trades constantly can buy a better drawdown figure at a cost that only surfaces later in brokerage and tax."),
+
+        Callout("The headline is a negative result, and it is useful", [
+          "The spread across all four schemes is 0.2 percentage points of drawdown.",
+          "They are within noise of each other. On this evidence the choice of retraining rule is not a meaningful lever - which tells you where NOT to spend further effort.",
+          "If one must be chosen: rolling or ewma, tied on efficiency at 1.1. Rolling is the simpler of the two to reason about and defend.",
+        ], "good"),
+
+        H2("2.1 vol_purged can be retired"),
+        P("It trades nearly twice as often as rolling -- 0.64 against 0.35 -- for no additional drawdown benefit, giving it the worst efficiency of the four."),
+        P("This reproduces the Phase 3 finding under a completely different setup. Phase 3 measured it under a single static fit and found purging bought coverage at the cost of precision; walk-forward, with shorter training windows where a crisis occupies a larger share, reaches the same conclusion. Two independent measurements agreeing is enough to close the question rather than leave it open."),
+
+        H2("2.2 Walk-forward beats the static fit, modestly"),
+        P("Phase 6's single 2016-2020 fit produced drawdown 0.8 percentage points WORSE than buy-and-hold. Every walk-forward scheme is 0.2 to 0.4 points BETTER. The improvement is small, but it is consistent in sign across all four schemes, which is what a model that refits as data arrives is supposed to deliver."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 3
+      c.push(
+        H1("3. A defect found on recheck"),
+        P("Isolation Forest has no sample_weight parameter, so exponential weighting has to be done by resampling. The obvious approach -- draw rows with replacement in proportion to weight -- turned out to be actively harmful."),
+        ...Code([
+          "drawing 100,000 rows with replacement",
+          "  ->  38,043 unique rows",
+          "  ->  duplication factor 2.63x",
+        ]),
+        Callout("Why duplicates are not neutral for this model", [
+          "Identical points cannot be separated from each other. A tree stops splitting once they are all that remain, so their path length inflates -- and short path length is what marks a point as anomalous.",
+          "So duplicated rows score as LESS anomalous. The scheme was systematically under-flagging exactly the recent rows EWMA exists to emphasise: the precise opposite of its intent.",
+        ], "warn"),
+        P("The fix is to sample WITHOUT replacement, using the Gumbel top-k trick rather than numpy's replace=False, which is prohibitively slow on hundreds of thousands of rows. Adding Gumbel noise to log-weights and taking the top k is mathematically identical to sequential weighted sampling without replacement, and runs in O(n log n)."),
+        P("The effect on results was real:"),
+        Tbl(["EWMA", "CAGR", "maxDD", "Trades/sym/yr", "Efficiency"], [
+          ["with replacement (defective)", "25.54%", "-19.6%", "0.47", "0.8"],
+          ["without replacement (fixed)", "25.78%", "-19.6%", "0.32", "1.1"],
+        ], [3200, 1500, 1500, 1600, 1200]),
+        P("A third fewer trades for the same drawdown benefit, and 0.24 points more CAGR. The duplication had been manufacturing spurious signals."),
+
+        H2("3.1 A related discovery worth stating"),
+        P("Decay 0.994 does not mean \u201crolling three years, weighted\u201d. It implies a half-life of 115 sessions and an effective sample of 167 -- roughly 0.66 years."),
+        ...Code([
+          "half-life          115 sessions   0.46 years",
+          "effective sample   167 sessions   0.66 years",
+          "rolling window     756 sessions   3.00 years",
+        ]),
+        P("So the schemes differ in LOOKBACK as well as in weighting, and EWMA has by a wide margin the shortest memory of the four. That is easy to assume otherwise, so a test now asserts it."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 4
+      c.push(
+        H1("4. The dev subset overstated everything"),
+        P("The comparison was first run on the ten-symbol development universe for speed. Against the full universe:"),
+        Tbl(["Scheme", "Dev DD saved", "Full DD saved", "Overstated by"], [
+          ["rolling", "+1.2pp", "+0.4pp", "3.2x"],
+          ["incremental", "+1.2pp", "+0.2pp", "6.6x"],
+          ["ewma", "+1.8pp", "+0.4pp", "5.1x"],
+          ["vol_purged", "+1.7pp", "+0.3pp", "5.0x"],
+        ], [2400, 2200, 2200, 2200]),
+        P("Three to six times too optimistic -- and the RANKING flipped, with ewma winning on the dev subset and rolling on the full set. That is what a 0.2 point spread means in practice: it is smaller than the noise introduced by changing the universe."),
+        P("This validates the small-universe warning built into the pipeline. The dev subset is for iteration speed; it cannot support a conclusion, because a ten-stock portfolio is dominated by whichever single name happens to have crashed."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 5
+      c.push(
+        H1("5. A performance change worth recording"),
+        P("Scoring is O(rows x trees), and the incremental scheme's training set grows past 400,000 rows across 66 refits. Building the training score distribution on all of them dominated the runtime."),
+        P("The distribution only has to be accurate enough to read percentiles from, and an empirical CDF from 50,000 draws is indistinguishable from one built on 400,000:"),
+        Tbl(["Score sample", "Fit time", "Median intensity", "p99 intensity"], [
+          ["all rows", "4.6s", "0.4988", "0.9887"],
+          ["50,000", "1.4s", "0.5029", "0.9889"],
+        ], [2400, 2200, 2200, 2200]),
+        P("3.3 times faster, with percentiles unchanged to three decimal places. Tree building is unaffected, since Isolation Forest already subsamples max_samples per tree regardless of how many rows it was given."),
+
+        H1("6. Known limitations"),
+        Num("The window contains no sharp crash. 2021-2026's worst drawdown was a slow bleed at near-normal volatility, so no retraining rule has much to work with. This comparison should be repeated on a window containing 2008 before it is treated as settled."),
+        Num("A 0.2pp spread cannot rank four schemes. The ordering here should be read as \u201cindistinguishable\u201d rather than as a ranking, and the dev-versus-full flip demonstrates exactly that."),
+        Num("EWMA resampling remains an approximation, even fixed. Weighted sampling without replacement is not identical to weighted tree splits; the honest alternative would be reimplementing the forest."),
+        Num("Only one decay value was tested. 0.994 comes from the project brief, and its 0.66-year effective memory may simply be too short - a slower decay would sit between ewma and rolling and was not explored."),
+        Num("Monthly refits are assumed throughout. Refit FREQUENCY was deliberately held constant so the training set could be attributed, but frequency may matter more than the rule, and that experiment has not been run."),
+
+        H1("7. Handoff to Phase 8"),
+        P("Phase 8 produces the drawdown analysis and per-stock visualisations: strategy against buy-and-hold for each symbol, with sell signals marked and the measured lead time annotated per event."),
+        P("It inherits a settled answer on retraining -- rolling, chosen for simplicity rather than because it measurably won -- and a clear statement that the choice does not matter much. That is worth carrying into the paper explicitly: a reader who assumes the retraining scheme is where the value lies should be told, with the measurement, that it is not."),
+      );
+
+      return c;
+    },
+  },
 };
 
 // =====================================================================
