@@ -38,7 +38,8 @@ from matplotlib.ticker import FuncFormatter
 
 __all__ = ["DrawdownStats", "drawdown_series", "drawdown_stats",
            "plot_symbol", "plot_portfolio", "plot_drawdown_scatter",
-           "plot_scheme_comparison", "plot_portfolio_schemes", "SCHEME_COLOURS"]
+           "plot_scheme_comparison", "plot_portfolio_schemes",
+           "SCHEME_COLOURS", "SCHEME_STYLES", "SCHEME_MARKERS"]
 
 #: One palette, used everywhere, so a colour means the same thing on every
 #: chart: the strategy is always blue, buy-and-hold always grey, exits red.
@@ -337,10 +338,32 @@ def plot_drawdown_scatter(table: pd.DataFrame, out_dir: Path) -> Path:
 
 #: One colour per retraining scheme, consistent across every chart.
 SCHEME_COLOURS = {
-    "rolling": "#1F4E79",
-    "incremental": "#C77800",
-    "ewma": "#1E7B34",
-    "vol_purged": "#8E44AD",
+    "rolling": "#0B5FA5",        # blue
+    "incremental": "#E8710A",    # orange
+    "ewma": "#1E9E4A",           # green
+    "vol_purged": "#8E44AD",     # purple
+}
+
+#: Distinct dash patterns as well as colours.
+#:
+#: Colour alone is not enough here. The schemes agree with each other almost
+#: exactly -- their drawdown curves sit within a fraction of a percent for most
+#: of the window -- so whichever is drawn last simply hides the others and the
+#: chart looks like a single line. Different dashes keep all of them legible
+#: where they coincide, which is most of the time and is itself the finding.
+SCHEME_STYLES = {
+    "rolling": (0, ()),                  # solid
+    "incremental": (0, (6, 2)),          # long dash
+    "ewma": (0, (2, 1.5)),               # short dash
+    "vol_purged": (0, (5, 1, 1, 1)),     # dash-dot
+}
+
+#: Marker per scheme, so exits stay distinguishable when they cluster.
+SCHEME_MARKERS = {
+    "rolling": "v",
+    "incremental": "s",
+    "ewma": "D",
+    "vol_purged": "P",
 }
 
 
@@ -353,13 +376,17 @@ def plot_scheme_comparison(
     """
     One stock, all retraining schemes overlaid.
 
-    Top panel: price, with each scheme's exits marked at its own height so
+    Top panel: price, with each scheme's SELL and BUY signals on its own row so
     overlapping signals stay readable.
     Bottom panel: drawdown per scheme against buy-and-hold.
 
-    The bottom panel is the one that answers the question. Returns are noisy
-    and a scheme can win on return by luck; drawdown depth is what the strategy
-    exists to reduce, so that is where a real difference would show.
+    The bottom panel answers the question. Returns are noisy and a scheme can
+    win on return by luck; drawdown depth is what the strategy exists to
+    reduce, so a real difference would show there.
+
+    Schemes are distinguished by colour AND dash pattern AND marker. Colour
+    alone is insufficient because the schemes agree almost exactly -- whichever
+    is drawn last would hide the rest, and the chart would look like one line.
     """
     close = close.dropna()
     if close.empty:
@@ -368,52 +395,66 @@ def plot_scheme_comparison(
     ret = close.pct_change().fillna(0.0)
     bench = (1 + ret).cumprod()
 
-    fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
+    fig, axes = plt.subplots(2, 1, figsize=(13.5, 8.5), sharex=True,
                              gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.12})
 
     ax = axes[0]
-    ax.plot(close.index, close.to_numpy(), color="#333333", linewidth=1.0, zorder=2)
+    ax.plot(close.index, close.to_numpy(), color="#444444", linewidth=1.0, zorder=2)
     ax.set_ylabel("price")
 
     lo, hi = close.min(), close.max()
-    span = hi - lo
+    span = hi - lo if hi > lo else 1.0
     summary = []
 
     ax2 = axes[1]
     dd_b = drawdown_series(bench)
-    ax2.fill_between(dd_b.index, dd_b.to_numpy(), 0, color=BENCHMARK, alpha=0.40,
+    ax2.fill_between(dd_b.index, dd_b.to_numpy(), 0, color=BENCHMARK, alpha=0.35,
                      label=f"buy & hold  {dd_b.min():.1%}")
 
     for i, (scheme, sig) in enumerate(signals_by_scheme.items()):
         colour = SCHEME_COLOURS.get(scheme, STRATEGY)
+        dashes = SCHEME_STYLES.get(scheme, (0, ()))
+        marker = SCHEME_MARKERS.get(scheme, "v")
+
         sig = sig.reindex(close.index)
         held = sig["in_position"].fillna(True).astype(bool)
         strat = (1 + ret * held.astype(float)).cumprod()
 
-        exits = sig.index[sig["action"] == "EXIT"]
-        if len(exits):
-            # Stagger marker heights so overlapping exits stay distinguishable.
-            y = lo + span * (0.04 + 0.05 * i)
-            ax.scatter(exits, np.full(len(exits), y), marker="v", s=55,
+        # Each scheme gets its own horizontal band, so a sell and the buy that
+        # follows it are visibly paired rather than lost in a common row.
+        row = lo - span * (0.06 + 0.055 * i)
+        sells = sig.index[sig["action"] == "EXIT"]
+        buys = sig.index[sig["action"] == "ENTER"]
+        if len(sells):
+            ax.scatter(sells, np.full(len(sells), row), marker=marker, s=52,
                        color=colour, zorder=5)
+        if len(buys):
+            ax.scatter(buys, np.full(len(buys), row), marker="^", s=52,
+                       facecolors="none", edgecolors=colour, linewidths=1.4, zorder=5)
+        ax.axhline(row, color=colour, linewidth=0.4, alpha=0.25, zorder=1)
+        ax.text(close.index[0], row, f" {scheme}  {len(sells)} sell / {len(buys)} buy",
+                va="center", fontsize=7.5, color=colour)
 
         dd = drawdown_series(strat)
-        ax2.plot(dd.index, dd.to_numpy(), color=colour, linewidth=1.2,
-                 label=f"{scheme}  {dd.min():.1%}  ({len(exits)} exits)")
+        ax2.plot(dd.index, dd.to_numpy(), color=colour, linewidth=1.5,
+                 linestyle=dashes, label=f"{scheme}  {dd.min():.1%}")
         summary.append(f"{scheme} {(strat.iloc[-1]-1)*100:+.0f}%")
 
+    ax.set_ylim(lo - span * (0.08 + 0.055 * len(signals_by_scheme)), hi + span * 0.05)
     ax.set_title(
         f"{symbol}   buy & hold {(bench.iloc[-1]-1)*100:+.0f}%   |   " + "   ".join(summary),
         loc="left", fontsize=11, fontweight="bold",
     )
-    for scheme in signals_by_scheme:
-        ax.scatter([], [], marker="v", s=55,
-                   color=SCHEME_COLOURS.get(scheme, STRATEGY), label=f"{scheme} exit")
-    ax.legend(loc="upper left", frameon=False, fontsize=9, ncol=len(signals_by_scheme))
+    # Legend explains the shapes; the coloured rows label the schemes.
+    ax.scatter([], [], marker="v", s=52, color="#444444", label="sell")
+    ax.scatter([], [], marker="^", s=52, facecolors="none", edgecolors="#444444",
+               linewidths=1.4, label="buy")
+    ax.legend(loc="upper left", frameon=False, fontsize=9, ncol=2)
     _style(ax)
 
     ax2.set_ylabel("drawdown")
-    ax2.legend(loc="lower left", frameon=False, fontsize=9)
+    ax2.legend(loc="lower left", frameon=False, fontsize=9,
+               ncol=min(len(signals_by_scheme) + 1, 3))
     _pct(ax2)
     _style(ax2)
 
@@ -440,7 +481,8 @@ def plot_portfolio_schemes(
             color=BENCHMARK, linewidth=1.6, label=f"buy & hold  {(benchmark.iloc[-1]/benchmark.iloc[0]-1)*100:+.0f}%")
     for scheme, eq in equity_by_scheme.items():
         ax.plot(eq.index, (eq / eq.iloc[0]).to_numpy(),
-                color=SCHEME_COLOURS.get(scheme, STRATEGY), linewidth=1.4,
+                color=SCHEME_COLOURS.get(scheme, STRATEGY), linewidth=1.6,
+                linestyle=SCHEME_STYLES.get(scheme, (0, ())),
                 label=f"{scheme}  {(eq.iloc[-1]/eq.iloc[0]-1)*100:+.0f}%")
     ax.set_ylabel("growth of 1")
     ax.legend(loc="upper left", frameon=False, fontsize=9)
@@ -455,7 +497,8 @@ def plot_portfolio_schemes(
     for scheme, eq in equity_by_scheme.items():
         dd = drawdown_series(eq)
         ax.plot(dd.index, dd.to_numpy(), color=SCHEME_COLOURS.get(scheme, STRATEGY),
-                linewidth=1.3, label=f"{scheme}  {dd.min():.1%}")
+                linewidth=1.6, linestyle=SCHEME_STYLES.get(scheme, (0, ())),
+                label=f"{scheme}  {dd.min():.1%}")
     ax.set_ylabel("drawdown")
     ax.legend(loc="lower left", frameon=False, fontsize=9)
     _pct(ax)
