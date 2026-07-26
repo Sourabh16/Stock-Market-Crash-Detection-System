@@ -48,6 +48,12 @@ from qbeast_crash.data import (
 from qbeast_crash.backtest import RateCard, TaxRates, run_backtest
 from qbeast_crash.labels import LEAD_BUCKETS, CrashDefinition, label_events, lead_time_report
 from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
+from qbeast_crash.plots import (
+    drawdown_stats,
+    plot_drawdown_scatter,
+    plot_portfolio,
+    plot_symbol,
+)
 from qbeast_crash.retrain import SCHEMES, SchemeResult, walk_forward
 from qbeast_crash.signals import (
     ReentryRule,
@@ -746,6 +752,108 @@ def phase_7(ctx: dict) -> dict:
     return {"schemes": table, "scheme_intensity": intensities}
 
 
+# =====================================================================
+# Phase 8 -- drawdown analysis and per-stock charts
+# =====================================================================
+def phase_8(ctx: dict) -> dict:
+    """
+    Per-symbol drawdown statistics and the charts that let them be inspected.
+
+    A single averaged drawdown number can hide almost anything. The per-symbol
+    table and the scatter chart show whether a headline is broad-based or
+    carried by a handful of names -- which, on this data, is the question that
+    matters.
+    """
+    _rule("PHASE 8  Drawdown analysis and charts")
+
+    signals, frames, calendar = ctx["signals"], ctx["frames"], ctx["calendar"]
+    scored, w = ctx["scored"], CFG.windows
+    oos = calendar[(calendar >= pd.Timestamp(w.backtest_start))
+                   & (calendar <= pd.Timestamp(w.backtest_end))]
+    figures = REPORTS / "figures"
+    defn = CFG.labels
+
+    rows, drawn = [], 0
+    for sym, frame in frames.items():
+        try:
+            sig = signals.xs(sym, level="symbol")
+        except KeyError:
+            continue
+        sig = sig.reindex(oos)
+        close = frame["close"].astype(float).reindex(oos).dropna()
+        if len(close) < 250:
+            continue
+
+        held = sig["in_position"].reindex(close.index).fillna(True).astype(bool)
+        ret = close.pct_change().fillna(0.0)
+        strat = (1 + ret * held.astype(float)).cumprod()
+        bench = (1 + ret).cumprod()
+
+        s_dd, b_dd = drawdown_stats(strat), drawdown_stats(bench)
+        rows.append({
+            "symbol": sym,
+            "strategy_max_drawdown": s_dd.max_drawdown,
+            "bh_max_drawdown": b_dd.max_drawdown,
+            "drawdown_saved_pp": (s_dd.max_drawdown - b_dd.max_drawdown) * 100,
+            "strategy_return": strat.iloc[-1] - 1,
+            "bh_return": bench.iloc[-1] - 1,
+            "days_under_water": s_dd.days_under_water,
+            "bh_days_under_water": b_dd.days_under_water,
+            "longest_underwater": s_dd.longest_underwater,
+            "bh_longest_underwater": b_dd.longest_underwater,
+            "time_to_recover": s_dd.time_to_recover,
+            "bh_time_to_recover": b_dd.time_to_recover,
+            "exits": int((sig["action"] == "EXIT").sum()),
+            "pct_days_in_cash": 100 * (1 - held.mean()),
+        })
+
+        ev = label_events(frame["close"].astype(float), sym, defn)
+        onsets = ev.crash_onsets[(ev.crash_onsets >= oos[0]) & (ev.crash_onsets <= oos[-1])]
+        if plot_symbol(sym, close, sig, scored.xs(sym, level="symbol")["intensity"],
+                       onsets, figures / "symbols") is not None:
+            drawn += 1
+
+    table = pd.DataFrame(rows).set_index("symbol").sort_values("drawdown_saved_pp")
+    table.to_csv(REPORTS / "phase8_drawdown_by_symbol.csv")
+
+    helped = (table["drawdown_saved_pp"] > 0.1).sum()
+    hurt = (table["drawdown_saved_pp"] < -0.1).sum()
+    untouched = (table["exits"] == 0).sum()
+
+    print(f"symbols analysed : {len(table)}   charts drawn: {drawn}")
+    print(f"  shallower drawdown than buy & hold : {helped}")
+    print(f"  deeper                             : {hurt}")
+    print(f"  never traded at all                : {untouched}")
+    print(f"\n  mean drawdown saved   : {table['drawdown_saved_pp'].mean():+.2f}pp")
+    print(f"  median drawdown saved : {table['drawdown_saved_pp'].median():+.2f}pp")
+
+    traded = table[table["exits"] > 0]
+    if len(traded):
+        print(f"\n  among the {len(traded)} symbols it actually traded:")
+        print(f"    mean drawdown saved : {traded['drawdown_saved_pp'].mean():+.2f}pp")
+        print(f"    best  {traded.index[-1]:12s} {traded['drawdown_saved_pp'].iloc[-1]:+.1f}pp")
+        print(f"    worst {traded.index[0]:12s} {traded['drawdown_saved_pp'].iloc[0]:+.1f}pp")
+
+    print(f"\n  time under water (sessions, median):")
+    print(f"    strategy   {table['days_under_water'].median():.0f}   "
+          f"longest spell {table['longest_underwater'].median():.0f}")
+    print(f"    buy & hold {table['bh_days_under_water'].median():.0f}   "
+          f"longest spell {table['bh_longest_underwater'].median():.0f}")
+
+    scatter = plot_drawdown_scatter(table, figures)
+
+    eq_s = DATA_PROCESSED / "equity_strategy.parquet"
+    eq_b = DATA_PROCESSED / "equity_buy_hold.parquet"
+    if eq_s.exists() and eq_b.exists():
+        plot_portfolio(pd.read_parquet(eq_s)["equity"],
+                       pd.read_parquet(eq_b)["equity"], figures)
+        print(f"\n  portfolio chart -> {figures / 'portfolio.png'}")
+    print(f"  scatter         -> {scatter}")
+    print(f"  per-symbol      -> {figures / 'symbols'}/  ({drawn} charts)")
+    print(f"  table           -> {REPORTS / 'phase8_drawdown_by_symbol.csv'}")
+    return {"drawdown_table": table}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
@@ -754,6 +862,7 @@ PHASES = {
     5: ("Signal generation", phase_5),
     6: ("Backtest with costs", phase_6),
     7: ("Retraining comparison", phase_7),
+    8: ("Drawdown analysis + charts", phase_8),
 }
 
 

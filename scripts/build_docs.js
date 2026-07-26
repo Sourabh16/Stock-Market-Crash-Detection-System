@@ -1477,7 +1477,7 @@ const PHASES = {
         status: "STATUS: COMPLETE - 168 tests passing",
         meta: [
           "66 monthly refits x 4 schemes, 126,728 scored symbol-days each",
-          "Spread across all four schemes: 0.2pp of drawdown",
+          "Scheme choice does not matter (0.2pp spread); EWMA decay does (3.1 sd)",
           "A defect in the EWMA implementation found and fixed on recheck",
         ],
       }));
@@ -1564,7 +1564,31 @@ const PHASES = {
         ], [3200, 1500, 1500, 1600, 1200]),
         P("A third fewer trades for the same drawdown benefit, and 0.24 points more CAGR. The duplication had been manufacturing spurious signals."),
 
-        H2("3.1 A related discovery worth stating"),
+        H2("3.1 The decay value: tested properly"),
+        P("Only the brief's value of 0.994 had been tested, so the whole range was swept on the full universe:"),
+        Tbl(["Decay", "Half-life", "Effective memory", "DD saved", "Trades/sym/yr", "Efficiency"], [
+          ["0.9800", "34 sessions", "0.20 years", "+0.3pp", "0.63", "0.4"],
+          ["0.9900", "69 sessions", "0.40 years", "+0.2pp", "0.48", "0.5"],
+          ["0.9940", "115 sessions", "0.66 years", "+0.4pp", "0.32", "1.1"],
+          ["0.9970", "231 sessions", "1.32 years", "-0.0pp", "0.19", "-0.1"],
+          ["0.9990", "693 sessions", "3.97 years", "+0.1pp", "0.30", "0.5"],
+          ["0.9995", "1386 sessions", "7.94 years", "+0.2pp", "0.28", "0.7"],
+        ], [1400, 1700, 1900, 1400, 1400, 1200]),
+        P("0.994 came out best on both drawdown saved and efficiency. But a single sweep on one seed proves nothing -- the values are non-monotone, which is what noise looks like, and each point carried its own sampling error. So the question became whether the differences exceed that error."),
+        P("Holding decay fixed at 0.994 and varying only the random seed gave a standard deviation of 0.05 points. Then the best and worst candidates were each run on four seeds:"),
+        Tbl(["Decay", "seed 0", "seed 1", "seed 2", "seed 3", "mean", "sd"], [
+          ["0.9940", "+0.37", "+0.37", "+0.41", "+0.33", "+0.37pp", "0.03"],
+          ["0.9970", "-0.01", "+0.17", "+0.23", "+0.01", "+0.10pp", "0.10"],
+          ["0.9990", "+0.14", "+0.27", "+0.15", "+0.13", "+0.17pp", "0.06"],
+        ], [1300, 1150, 1150, 1150, 1150, 1300, 800]),
+        Callout("The decay value IS a real lever - unlike the scheme choice", [
+          "0.994 and 0.997 are 0.27 points apart with a pooled standard deviation of 0.09 - a separation of 3.1 standard deviations. That is signal, not luck.",
+          "0.994 also has the LOWEST variance across seeds (0.03 against 0.10 and 0.06), so it is the most stable as well as the best.",
+          "The brief's value is therefore vindicated on measurement rather than accepted on authority. Note the contrast: the choice of SCHEME does not matter (0.2pp spread, indistinguishable), but within the EWMA scheme the decay DOES.",
+        ], "good"),
+        P("The methodological point generalises. A single run of a stochastic model cannot rank anything: the only way to know whether a difference is real is to measure how much the answer moves when nothing meaningful changes. Here the noise floor is 0.05 points, so a 0.27 point gap is meaningful and a 0.2 point gap between schemes is not."),
+
+        H2("3.2 A related discovery worth stating"),
         P("Decay 0.994 does not mean \u201crolling three years, weighted\u201d. It implies a half-life of 115 sessions and an effective sample of 167 -- roughly 0.66 years."),
         ...Code([
           "half-life          115 sessions   0.46 years",
@@ -1605,7 +1629,7 @@ const PHASES = {
         Num("The window contains no sharp crash. 2021-2026's worst drawdown was a slow bleed at near-normal volatility, so no retraining rule has much to work with. This comparison should be repeated on a window containing 2008 before it is treated as settled."),
         Num("A 0.2pp spread cannot rank four schemes. The ordering here should be read as \u201cindistinguishable\u201d rather than as a ranking, and the dev-versus-full flip demonstrates exactly that."),
         Num("EWMA resampling remains an approximation, even fixed. Weighted sampling without replacement is not identical to weighted tree splits; the honest alternative would be reimplementing the forest."),
-        Num("Only one decay value was tested. 0.994 comes from the project brief, and its 0.66-year effective memory may simply be too short - a slower decay would sit between ewma and rolling and was not explored."),
+        Num("The decay sweep covered 0.980 to 0.9995. Values outside that range, and the interaction between decay and refit frequency, were not explored."),
         Num("Monthly refits are assumed throughout. Refit FREQUENCY was deliberately held constant so the training set could be attributed, but frequency may matter more than the rule, and that experiment has not been run."),
 
         H1("7. Handoff to Phase 8"),
