@@ -17,8 +17,10 @@ import pytest
 from qbeast_crash.signals import (
     ReentryRule,
     SignalConfig,
+    equal_weight_equity,
     generate_signals,
     market_signal,
+    performance,
     signal_strength,
 )
 
@@ -186,3 +188,59 @@ def test_signal_strength_ranks_by_intensity_and_move_size():
 def test_signal_strength_is_never_nan():
     f = pd.DataFrame({"intensity": [np.nan, 0.99], "slope_z": [-1.0, np.nan]})
     assert signal_strength(f).notna().all()
+
+
+# =====================================================================
+# Portfolio aggregation
+# =====================================================================
+def test_equal_weight_equity_is_a_portfolio_not_a_geometric_mean():
+    """
+    Averaging per-stock LOG equity and exponentiating gives the geometric mean
+    of individual outcomes, not a portfolio -- it discards the diversification
+    benefit. Measured on the real universe, that understated CAGR by 4.75pp.
+
+    Two anti-correlated assets are the clean demonstration: a rebalanced
+    portfolio of them grows, while the geometric mean of the pair does not.
+    """
+    idx = pd.bdate_range("2021-01-04", periods=200)
+    rng = np.random.default_rng(0)
+    a = rng.normal(0.0005, 0.02, 200)
+    ret = pd.DataFrame({"A": a, "B": -a}, index=idx)
+
+    portfolio = equal_weight_equity(ret)
+    geometric = np.exp(np.log1p(ret).cumsum().mean(axis=1))
+
+    assert portfolio.iloc[-1] > geometric.iloc[-1]
+
+
+def test_equal_weight_equity_matches_a_single_asset():
+    idx = pd.bdate_range("2021-01-04", periods=100)
+    ret = pd.DataFrame({"A": np.full(100, 0.01)}, index=idx)
+    assert equal_weight_equity(ret).iloc[-1] == pytest.approx(1.01 ** 100)
+
+
+def test_positions_gate_the_returns():
+    """A stock held out of the portfolio must contribute nothing."""
+    idx = pd.bdate_range("2021-01-04", periods=50)
+    ret = pd.DataFrame({"A": np.full(50, 0.02)}, index=idx)
+    pos = pd.DataFrame({"A": [True] * 25 + [False] * 25}, index=idx)
+
+    held = equal_weight_equity(ret, pos)
+    assert held.iloc[-1] == pytest.approx(1.02 ** 25)
+    assert held.iloc[-1] < equal_weight_equity(ret).iloc[-1]
+
+
+def test_performance_computes_cagr_and_drawdown():
+    idx = pd.bdate_range("2021-01-04", periods=253)
+    eq = pd.Series(np.linspace(1.0, 2.0, 253), index=idx)
+    stats = performance(eq, years=1.0)
+    assert stats["cagr"] == pytest.approx(1.0, abs=1e-9)
+    assert stats["max_drawdown"] == pytest.approx(0.0, abs=1e-12)
+
+    dipped = pd.Series([1.0, 1.5, 0.9, 1.2], index=pd.bdate_range("2021-01-04", periods=4))
+    assert performance(dipped, years=1.0)["max_drawdown"] == pytest.approx(-0.4)
+
+
+def test_performance_handles_empty_input():
+    stats = performance(pd.Series(dtype=float), years=1.0)
+    assert np.isnan(stats["cagr"]) and np.isnan(stats["max_drawdown"])

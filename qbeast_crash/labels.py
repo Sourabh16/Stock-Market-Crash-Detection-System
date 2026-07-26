@@ -171,18 +171,15 @@ def _onsets(flags: pd.Series, min_gap: int) -> pd.DatetimeIndex:
     if flagged.size == 0:
         return pd.DatetimeIndex([])
 
-    starts = [flagged[0]]
-    for position in flagged[1:]:
-        if position - starts[-1] >= min_gap and position - 1 not in flagged:
-            starts.append(position)
-        elif position - starts[-1] >= min_gap:
-            starts.append(position)
-    # De-duplicate while preserving order.
-    keep, last = [], -10_000
-    for s in starts:
-        if s - last >= min_gap:
-            keep.append(s)
-            last = s
+    # Walk the flagged positions and keep one start per episode: a flagged day
+    # begins a NEW event only if it is at least min_gap sessions after the last
+    # one we kept. Everything closer is the same episode continuing.
+    keep: list[int] = []
+    last = -10_000
+    for position in flagged:
+        if position - last >= min_gap:
+            keep.append(int(position))
+            last = position
     return pd.DatetimeIndex(flags.index[keep])
 
 

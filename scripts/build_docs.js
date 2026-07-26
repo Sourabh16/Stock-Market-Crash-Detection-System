@@ -1063,6 +1063,241 @@ const PHASES = {
       return c;
     },
   },
+
+  phase4: {
+    slug: "Phase4_Lead_Time",
+    docTitle: "QBEAST Phase 4 - Labels and Lead Time",
+    runningHead: "QBEAST \u00b7 Phase 4 - Lead Time",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 4",
+        title: "Labels & Lead Time",
+        subtitle: "The go/no-go gate: does the signal arrive early enough to be worth anything?",
+        status: "STATUS: COMPLETE - the answer changes what this project can claim",
+        meta: [
+          "705 crash onsets out of sample, measured against a random baseline",
+          "Early-warning skill: 0.88x - no better than chance",
+          "Short-horizon lift: 110x at one day",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      c.push(
+        H1("1. Why this phase came before the backtest"),
+        P("Every measurement so far showed that the signal fires when crashes are near. None showed how EARLY. Those are different questions, and only the second one matches the requirement."),
+        P("The phase was deliberately placed ahead of the backtest, the retraining comparison and the dashboard. If the answer had come out badly after those were built, weeks of work would have been resting on a premise that does not hold. Learning it from a histogram costs an afternoon."),
+        Callout("The label never touches training", [
+          "Nothing in this module is imported by the model, and no threshold defined here influences fitting.",
+          "Isolation Forest is unsupervised. If the crash definition were derived from the model, the model would be defining the event it is then scored on detecting -- the evaluation would always look good and would mean nothing.",
+        ]),
+        Break(),
+      );
+
+      c.push(
+        H1("2. Two calibration errors, found before the result"),
+        H2("2.1 The threshold was calibrated on the wrong thing"),
+        P("A forward five-day drawdown of five percent is genuinely rare for the index -- 5.44% of days. Applied to individual stocks, which are roughly twice as volatile, it is an ordinary pullback."),
+        Tbl(["Threshold", "Onsets 2021-2026", "Per stock per year"], [
+          ["-5%", "3,950", "7.6   (ordinary pullbacks)"],
+          ["-8%", "1,479", "2.9"],
+          ["-10%", "705", "1.4   (adopted)"],
+          ["-12%", "350", "0.7"],
+          ["-20%", "36", "0.1"],
+        ], [2200, 3000, 3800]),
+        P("At -5% the event count is inflated sevenfold and every recall figure computed against it is meaningless. Stocks now use -10%; the index keeps -5%."),
+
+        H2("2.2 Raw recall is not evidence of skill"),
+        P("Crash events are frequent enough that any rule firing often will land near one by chance. A recall figure on its own therefore says nothing at all. Every rule is now measured against a RANDOM signal firing at exactly the same rate, on the same calendar."),
+        P("This is the single most transferable habit in the project: before believing any number, ask what a deliberately stupid baseline would score."),
+        Break(),
+      );
+
+      c.push(
+        H1("3. The result"),
+        H2("3.1 Early warning: none"),
+        Tbl(["Rule", "Signals", "Recall", "Random", "Skill"], [
+          ["intensity 0.99+ and AccelDecline", "130", "2.2%", "2.5%", "0.88x"],
+          ["intensity 0.95+ and AccelDecline", "958", "8.0%", "14.5%", "0.55x"],
+          ["intensity 0.99+ (no direction)", "326", "4.8%", "5.9%", "0.80x"],
+        ], [3200, 1400, 1400, 1400, 1600]),
+        P("Every rule sits at or below 1.00x. At a fifteen-day horizon the detector provides no early warning beyond chance. The requirement to predict crashes two to three days ahead, in the sense of forecasting from a calm market, is not met."),
+
+        H2("3.2 Short-horizon information: a great deal"),
+        Tbl(["Horizon", "Base rate", "Given a signal", "Lift"], [
+          ["1 day", "0.06%", "6.92%", "110.0x"],
+          ["2 days", "0.23%", "13.08%", "57.9x"],
+          ["3 days", "0.57%", "20.00%", "35.1x"],
+          ["5 days", "1.48%", "23.08%", "15.6x"],
+          ["10 days", "4.82%", "26.15%", "5.4x"],
+        ], [2000, 2200, 2400, 2400]),
+        P("Probability of a ten percent drawdown within H days. The lift decays sharply with horizon, which is the signature of a coincident detector rather than a predictive one."),
+        P("Confirmed directly: the median same-day return on signal days is -1.14%, against +0.02% across all days. The signal fires as a decline BEGINS, not before it."),
+
+        H2("3.3 Reconciling with Phase 3"),
+        RichP([
+          { text: "Phase 3 reported 3.48x lift and this phase reports no skill. Both are correct, because they measure different quantities. Phase 3 measured P(crash given a signal) -- " },
+          { text: "precision", bold: true },
+          { text: ", which is high. This phase measures P(signal given a crash) -- " },
+          { text: "recall", bold: true },
+          { text: ", which is low. The signal is precise but rare, firing on 130 of 128,737 symbol-days, so it can only ever cover a fraction of 705 events." },
+        ]),
+        P("Confusing precision with recall is the most common mistake in applied machine learning, and this is a clean example of why it matters: the same detector looks excellent under one and useless under the other."),
+        Break(),
+      );
+
+      c.push(
+        H1("4. What it means"),
+        P("The honest framing is fast reaction rather than prediction: recognise within a day that a decline has started, and leave before it deepens. A 110-fold edge at one day is exactly what an exit rule needs."),
+        P("This is a weaker claim than the original requirement, and it is the one the evidence supports. It is also enough. Drawdown reduction was always the primary objective, and reducing drawdown does not require forecasting from a calm market -- it requires reacting faster than the decline completes."),
+        Callout("For the research paper", [
+          "\u201cUnsupervised anomaly detection reduces drawdown through rapid exit\u201d is honest, measurable, and defensible.",
+          "\u201cPredicts crashes three days ahead\u201d would not survive review, and now there is a measurement showing exactly why.",
+          "Reporting the negative result alongside the positive one is a strength, not a weakness. It is evidence the evaluation was designed to be capable of failing.",
+        ], "good"),
+
+        H1("5. Known limitations"),
+        Num("The random baseline assumes signals could have fallen anywhere. In reality they cluster in volatile periods, which are also when crashes occur, so the true baseline is arguably even higher and the measured skill even weaker."),
+        Num("A fifteen-day lookback was chosen as the search window. A longer one would find more coincidental hits, not more genuine warnings."),
+        Num("Events overlap across correlated stocks: one market episode produces many symbol-level events on the same day, so the effective independent sample is far smaller than 705."),
+        Num("The -10% threshold is a judgement, though the sensitivity table shows the conclusion is not delicate."),
+      );
+
+      return c;
+    },
+  },
+
+  phase5: {
+    slug: "Phase5_Signals",
+    docTitle: "QBEAST Phase 5 - Signal Generation",
+    runningHead: "QBEAST \u00b7 Phase 5 - Signals",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 5",
+        title: "Signal Generation",
+        subtitle: "From anomaly score to position, under the fast-reaction framing",
+        status: "STATUS: COMPLETE - 125 tests passing",
+        meta: [
+          "Hold/cash state machine with whipsaw guards",
+          "2020 stress test: 7.7 points of drawdown saved, with higher return",
+          "2021-2026: 0.4 trades per symbol per year - correctly quiet",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      c.push(
+        H1("1. What this phase decides"),
+        P("Intensity says today is unusual and phase says the move is downward. Neither is a position. Something has to decide when to leave, when to come back, and how to avoid doing either too often."),
+        P("Long is the default state. The model is not asked to pick stocks or time the market continuously -- only to step out when a decline begins and step back in afterwards."),
+
+        H2("1.1 Re-entry is the hard half"),
+        P("Exiting is comparatively easy: the exit rule carries a hundredfold edge at a one-day horizon. Coming back is the difficulty. Crashes are followed by recoveries, and a strategy that exits well but re-enters late loses more to the missed rebound than it ever saved on the decline. That failure mode is why most crash-avoidance strategies underperform buy-and-hold despite being right about the crash."),
+        P("Four re-entry rules were therefore implemented and compared rather than one being assumed: on a confirmed rally, when the decline stops accelerating, after a fixed number of sessions, and as soon as the phase is no longer an accelerating decline."),
+        Callout("The comparison was less decisive than expected", [
+          "All four land within 0.7 percentage points of CAGR and a fraction of a point of drawdown.",
+          "That is itself worth knowing: the re-entry rule matters far less than the effort spent choosing it would suggest, because the whipsaw guards -- cooldown, minimum hold, and a hard cap on time in cash -- dominate the outcome.",
+        ]),
+
+        H2("1.2 Whipsaw guards are not polish"),
+        P("Every round trip pays brokerage, securities transaction tax, stamp duty, GST and slippage, and converts a long-term holding into a short-term one for tax. A rule that is right slightly more often than it is wrong can still lose money if it trades enough. The guards are load-bearing."),
+        Break(),
+      );
+
+      c.push(
+        H1("2. The headline result"),
+        H2("2.1 On the 2021-2026 window, almost nothing happens"),
+        Tbl(["Re-entry rule", "Trades/sym/yr", "Days in cash", "CAGR", "B&H CAGR", "maxDD", "B&H maxDD"], [
+          ["rally_signal", "0.13", "0.7%", "26.12%", "25.64%", "-19.9%", "-20.0%"],
+          ["decel", "0.14", "0.5%", "25.85%", "25.64%", "-19.9%", "-20.0%"],
+          ["time", "0.14", "0.2%", "25.94%", "25.64%", "-19.9%", "-20.0%"],
+          ["not_declining", "0.14", "0.2%", "26.00%", "25.64%", "-19.9%", "-20.0%"],
+        ], [1900, 1500, 1300, 1200, 1300, 900, 900]),
+        P("Roughly one trade per symbol every seven years, half a percent of days in cash, and drawdown within a tenth of a point of simply holding. Lowering the exit threshold from 0.99 to 0.70 does not change this -- it only trades more and earns less, with CAGR falling from 20.9% to 17.7% in an earlier sweep."),
+
+        H2("2.2 The reason is the window, not the model"),
+        Tbl(["", "2020-01 to 2020-03", "2024-09 to 2025-02"], [
+          ["Duration", "67 days", "154 days"],
+          ["Worst single day", "-8.3%", "-3.2%"],
+          ["Days beyond 3%", "8", "1"],
+          ["Annualised volatility", "38.5%", "16.5%"],
+          ["Drawdown", "-37.8%", "-21.2%"],
+        ], [3000, 3000, 3000]),
+        P("The worst drawdown of the backtest window was a slow bleed at near-normal volatility with a single day beyond three percent. There is nothing in it for an anomaly detector to fire on. The system targets sharp declines, and this window contains none -- so it correctly does almost nothing."),
+        P("A backtest window that lacks the risk a system is designed for cannot tell you whether the system works. It can only tell you the system does not misbehave in its absence, which is worth knowing but is a different question."),
+        Break(),
+      );
+
+      c.push(
+        H1("3. Stress test"),
+        P("Training on 2016-2019 keeps COVID genuinely out of sample -- the model has never seen a crash of that magnitude when it is asked to react to one."),
+        Tbl(["Window", "Strategy", "Buy & hold", "Strat DD", "B&H DD", "DD saved", "Trades"], [
+          ["2020 Feb-Apr (the crash)", "-16.4%", "-21.1%", "-28.7%", "-36.6%", "+7.9pp", "10.30"],
+          ["2020 full year", "+32.2%", "+24.6%", "-29.2%", "-36.8%", "+7.7pp", "3.17"],
+          ["2021-2026 (no crash)", "+245.2%", "+244.9%", "-19.7%", "-20.0%", "+0.3pp", "0.40"],
+        ], [2400, 1300, 1300, 1300, 1200, 1200, 1300]),
+        Callout("What this shows", [
+          "Nearly eight points of drawdown saved in the crash year, with HIGHER return, on a model that never saw COVID.",
+          "In the quiet window it stays out of the way at 0.40 trades per symbol per year. The guards hold.",
+          "Read as insurance: it costs very little in quiet years and pays back meaningfully when a crash arrives.",
+        ], "good"),
+        P("The caveat that must accompany every statement of this result: 2020 is ONE event. Nothing generalises from a sample of one. Extending the training window back to include 2008 would give a second crash to test against, and that is the obvious next step for anyone wanting confidence in the number."),
+        Break(),
+      );
+
+      c.push(
+        H1("4. Two bugs found by review"),
+        H2("4.1 A double lag, caught by a test"),
+        P("The state machine assigned the position for each bar BEFORE processing that bar's decision, which already implements next-day execution correctly. A further shift had been applied on top, delaying every trade by a second day."),
+        P("No backtest would have complained. It would simply have reported worse numbers forever, and they would have looked plausible."),
+
+        H2("4.2 A geometric mean masquerading as a portfolio"),
+        P("Per-stock log equity curves were being averaged and exponentiated. That gives the geometric mean of individual stock outcomes, which is not a portfolio -- it silently discards the diversification benefit, since the mean of logarithms sits below the logarithm of the mean."),
+        Tbl(["Method", "CAGR", "maxDD"], [
+          ["Geometric mean of stocks (wrong)", "20.69%", "-21.2%"],
+          ["Equal-weight, daily rebalanced (right)", "25.44%", "-20.0%"],
+        ], [4400, 2300, 2300]),
+        P("A 4.75 point understatement of CAGR. Correcting it also moved the headline stress-test figure from a claimed ten points of drawdown saved to a true 7.7 -- in other words, the error had been flattering the result in one place and penalising it in another."),
+        Callout("Why both were worth finding", [
+          "Neither produced an error, a warning, or an implausible number. Both simply produced slightly wrong answers that looked entirely reasonable.",
+          "This is the recurring lesson of the project: in a numerical pipeline, the dangerous failures are the ones that stay quiet.",
+        ], "warn"),
+        Break(),
+      );
+
+      c.push(
+        H1("5. The market-wide overlay"),
+        P("A systemic de-risking flag fires when breadth reaches 75 percent and the median slope falls to -1.5 sigma. Both conditions are required, because breadth alone cannot separate a systemic crash from a broad pullback -- around ninety percent of stocks were declining on the COVID crash and on several ordinary pullbacks alike, and only the median slope distinguishes them."),
+        P("Out of sample it fired zero times in 1,344 sessions. The threshold was calibrated on history including COVID, and 2021-2026 never came close."),
+        P("That is arguably correct behaviour rather than a fault. A systemic-crash trigger SHOULD be rare, and a version tuned to fire in a period containing no systemic crash would be fitted to noise."),
+
+        H1("6. Known limitations"),
+        Num("The stress test rests on a single crash. Everything about the magnitude of the benefit is uncertain from n=1."),
+        Num("All figures are gross of costs. Phase 6 adds the Indian cost and tax stack, though at 0.4 trades per symbol per year the impact should be small - itself a finding worth stating."),
+        Num("The strategy is evaluated as an equal-weighted portfolio with no position sizing. Top-N selection by signal strength is implemented but not yet exercised."),
+        Num("Re-entry rules differ by less than the noise in a single backtest window, so the choice between them is not well supported by evidence."),
+        Num("The market overlay is untested, having never fired out of sample."),
+
+        H1("7. Handoff to Phase 6"),
+        P("Phase 6 adds the realistic cost and tax model and produces the definitive equity curves. It inherits the position panel, the equal-weight portfolio helper, and a settled framing."),
+        P("The interesting question for Phase 6 is not whether costs erode the strategy -- at this trade frequency they cannot -- but how much of the drawdown benefit survives the tax treatment, since every crash exit converts a long-term holding into a short-term one and moves the rate from 12.5% to 20%."),
+      );
+
+      return c;
+    },
+  },
 };
 
 // =====================================================================

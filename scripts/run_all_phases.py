@@ -50,8 +50,10 @@ from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
 from qbeast_crash.signals import (
     ReentryRule,
     SignalConfig,
+    equal_weight_equity,
     generate_signals,
     market_signal,
+    performance,
     signal_strength,
 )
 from qbeast_crash.features import (
@@ -358,42 +360,40 @@ def phase_5(ctx: dict) -> dict:
     print(f"{'rule':16s}{'trades/sym/yr':>15s}{'days in cash':>14s}"
           f"{'strat CAGR':>12s}{'B&H CAGR':>10s}{'maxDD':>9s}{'B&H maxDD':>11s}")
 
+    # SIMPLE returns, aligned as a panel -- equal_weight_equity compounds the
+    # cross-sectional mean each day, which is a real portfolio. Averaging
+    # per-stock log equity would discard the diversification benefit and
+    # understate every figure by ~4.75pp CAGR.
+    ret_panel = pd.DataFrame(
+        {s: f["close"].astype(float).pct_change() for s, f in frames.items()}
+    ).reindex(oos)
+
     results = {}
     for rule in ReentryRule.ALL:
-        eq_s, eq_b, n_trades, cash_share = [], [], 0, []
+        pos, n_trades = {}, 0
         for sym, frame in frames.items():
             sub = scored.xs(sym, level="symbol")
             sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
             if len(sub) < 250:
                 continue
             sig = generate_signals(sub, cfg, reentry=rule)
-
-            close = frame["close"].astype(float).reindex(sub.index)
-            ret = np.log(close / close.shift(1)).fillna(0.0)
-
-            strat = (ret * sig["in_position"].astype(float)).cumsum()
-            bh = ret.cumsum()
-            eq_s.append(strat.rename(sym)); eq_b.append(bh.rename(sym))
+            pos[sym] = sig["in_position"].reindex(oos, fill_value=True)
             n_trades += int((sig["action"] == "EXIT").sum())
-            cash_share.append(1.0 - sig["in_position"].mean())
 
-        # Equal-weight the log-equity curves across symbols.
-        S = pd.concat(eq_s, axis=1).mean(axis=1)
-        B = pd.concat(eq_b, axis=1).mean(axis=1)
+        pos_panel = pd.DataFrame(pos).reindex(columns=ret_panel.columns, fill_value=True)
+        cols = ret_panel.columns.intersection(pos_panel.columns)
 
-        def stats(logeq):
-            eq = np.exp(logeq)
-            cagr = eq.iloc[-1] ** (1 / years) - 1
-            dd = (eq / eq.cummax() - 1).min()
-            return cagr, dd
+        strat = performance(equal_weight_equity(ret_panel[cols], pos_panel[cols]), years)
+        bh = performance(equal_weight_equity(ret_panel[cols]), years)
 
-        cs, ds = stats(S); cb, db = stats(B)
         tpy = n_trades / len(frames) / years
-        print(f"{rule:16s}{tpy:15.2f}{np.mean(cash_share):13.1%}"
-              f"{cs:12.2%}{cb:10.2%}{ds:9.1%}{db:11.1%}")
-        results[rule] = {"cagr": cs, "maxdd": ds, "trades_per_sym_yr": tpy,
-                         "cash_share": float(np.mean(cash_share)),
-                         "bh_cagr": cb, "bh_maxdd": db}
+        cash = 1.0 - pos_panel.to_numpy().mean()
+        print(f"{rule:16s}{tpy:15.2f}{cash:13.1%}"
+              f"{strat['cagr']:12.2%}{bh['cagr']:10.2%}"
+              f"{strat['max_drawdown']:9.1%}{bh['max_drawdown']:11.1%}")
+        results[rule] = {"cagr": strat["cagr"], "maxdd": strat["max_drawdown"],
+                         "trades_per_sym_yr": tpy, "cash_share": float(cash),
+                         "bh_cagr": bh["cagr"], "bh_maxdd": bh["max_drawdown"]}
 
     best = max(results, key=lambda r: results[r]["maxdd"])     # least negative
     print(f"\nshallowest drawdown: {best}")
@@ -425,22 +425,26 @@ def phase_5(ctx: dict) -> dict:
                         ("2021-2026 (no crash)", "2021-01-01", "2026-06-05")]:
         win = calendar[(calendar >= pd.Timestamp(a)) & (calendar <= pd.Timestamp(b))]
         yrs = max((win[-1] - win[0]).days / 365.25, 1 / 12)
-        eq_s, eq_b, n_tr = [], [], 0
+        pos, n_tr = {}, 0
         for sym, frame in frames.items():
             sub = stressed.xs(sym, level="symbol")
             sub = sub[(sub.index >= win[0]) & (sub.index <= win[-1])]
             if len(sub) < 40:
                 continue
             sg = generate_signals(sub, cfg, reentry=best)
-            close = frame["close"].astype(float).reindex(sub.index)
-            ret = np.log(close / close.shift(1)).fillna(0.0)
-            eq_s.append((ret * sg["in_position"].astype(float)).cumsum().rename(sym))
-            eq_b.append(ret.cumsum().rename(sym))
+            pos[sym] = sg["in_position"].reindex(win, fill_value=True)
             n_tr += int((sg["action"] == "EXIT").sum())
-        S2 = np.exp(pd.concat(eq_s, axis=1).mean(axis=1))
-        B2 = np.exp(pd.concat(eq_b, axis=1).mean(axis=1))
-        ds = (S2 / S2.cummax() - 1).min() * 100
-        db = (B2 / B2.cummax() - 1).min() * 100
+
+        rp = pd.DataFrame(
+            {s: f["close"].astype(float).pct_change() for s, f in frames.items()}
+        ).reindex(win)
+        pp = pd.DataFrame(pos)
+        cols = rp.columns.intersection(pp.columns)
+
+        S2 = equal_weight_equity(rp[cols], pp[cols])
+        B2 = equal_weight_equity(rp[cols])
+        ds = performance(S2, yrs)["max_drawdown"] * 100
+        db = performance(B2, yrs)["max_drawdown"] * 100
         print(f"{label:26s}{(S2.iloc[-1] - 1) * 100:10.1f}%{(B2.iloc[-1] - 1) * 100:9.1f}%"
               f"{ds:9.1f}%{db:8.1f}%{ds - db:+9.1f}pp{n_tr / len(frames) / yrs:9.2f}")
 
