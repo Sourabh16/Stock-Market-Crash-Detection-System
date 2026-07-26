@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Data is NOT tracked.
+#
+# data/raw holds ~77 MB of vendor-sourced (kite / upstox) price data. It is
+# proprietary, it is large, and once pushed to a public remote it cannot be
+# unpublished. Generated outputs are reproducible from it, so they are not
+# tracked either -- run scripts/run_phase1.py to rebuild them.
+#
+# To track the data anyway, delete this block and consider Git LFS.
+#
+# Leading slash matters: a bare `data/` also matches qbeast_crash/data/ and
+# would silently drop the loader package from the repo.
+# ---------------------------------------------------------------------------
+/data/
+
+# Generated reports and figures (run_phase1.py recreates the directory)
+/reports/
+
+# Local Claude Code settings
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Node (only used to build the documentation docx)
+node_modules/
+package-lock.json
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
