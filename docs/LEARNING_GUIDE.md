@@ -58,6 +58,37 @@ python3 scripts/run_all_phases.py --phase 4
 python3 scripts/run_all_phases.py --list
 ```
 
+### Fast iteration on 10 stocks
+
+```bash
+python3 scripts/run_all_phases.py --dev
+```
+
+4 seconds instead of 40, on a representative 10-symbol subset — spanning 25.8%
+to 47.9% annualised volatility against a universe median of 34.4%, all with
+pre-2016 history.
+
+```bash
+python3 scripts/run_all_phases.py --dev --phase 2
+```
+
+```bash
+python3 scripts/run_all_phases.py --symbols RELIANCE,TCS,ITC
+```
+
+> **Use `--dev` for:** checking the pipeline runs, inspecting per-stock signals,
+> iterating on features.
+>
+> **Never use it for:** portfolio returns or drawdown comparisons. Measured on
+> this subset, **ADANIENT alone contributed 93% of the edge** and 7 of 10 symbols
+> never traded. The subset reports **+33%** where the full universe reports
+> **−4.4%** — both correct, because ADANIENT is 10% of a ten-stock portfolio and
+> ~1% of the full one. The run prints a warning when this applies.
+>
+> This is a general lesson worth keeping: **a small sample lets one observation
+> carry the whole result.** It's the same reason the 2020 stress test carries an
+> n=1 caveat.
+
 **What each phase does:**
 
 | Phase | Reads | Writes | Question it answers |

@@ -295,7 +295,7 @@ def load_universe(
     trail -- it is written to disk each run so a data regression shows up as a
     diff rather than as a mysteriously different backtest.
     """
-    symbols = symbols or list_symbols()
+    symbols = list(symbols) if symbols else list_symbols()
     frames: dict[str, pd.DataFrame] = {}
     reports: list[dict] = []
 

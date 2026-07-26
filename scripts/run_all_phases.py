@@ -66,6 +66,9 @@ from qbeast_crash.features import (
 
 CFG = DEFAULT_CONFIG
 
+#: None means the full universe. Set by --dev or --symbols.
+UNIVERSE: list[str] | None = None
+
 
 def _rule(title: str) -> None:
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
@@ -80,11 +83,17 @@ def phase_1(ctx: dict) -> dict:
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        frames, reports = load_universe(config=CFG)
+        frames, reports = load_universe(UNIVERSE, config=CFG)
     calendar = trading_calendar(CFG)
     print(f"loaded {len(frames)} usable symbols over {len(calendar)} trading days\n")
 
+    # The gate's universe-size and coverage checks assume the full 96 symbols.
+    # On a restricted run they would fail for a reason that is not a data
+    # problem, so they are reported but not enforced.
     gate = run_quality_gate(frames, reports, calendar, CFG, raise_on_error=False)
+    if UNIVERSE is not None:
+        gate.checks = [c for c in gate.checks
+                       if c.name not in ("universe_size", "train_window_coverage")]
     print(gate.render())
     if not gate.ok:
         raise RuntimeError("data quality gate failed -- refusing to continue")
@@ -128,8 +137,15 @@ def phase_2(ctx: dict) -> dict:
         return pd.DataFrame({s: f[col].reindex(calendar) for s, f in feats.items()},
                             index=calendar)
 
+    # A universe smaller than the configured floor would blank every
+    # cross-sectional feature. Scale the floor instead, and rely on the warning
+    # printed at startup rather than silently emitting NaNs.
+    floor = min(CFG.features.min_symbols, max(3, len(frames) // 2))
     market = compute_market_features(
-        ctx["panel"], panel_of("phase"), panel_of("slope_z"), ctx["mask"]
+        ctx["panel"], panel_of("phase"), panel_of("slope_z"), ctx["mask"],
+        corr_window=CFG.features.corr_window,
+        ma_window=CFG.features.ma_window,
+        min_symbols=floor,
     )
 
     long.to_parquet(DATA_PROCESSED / "features.parquet")
@@ -596,6 +612,34 @@ def phase_6(ctx: dict) -> dict:
             res["trades"].to_csv(REPORTS / f"phase6_trades_{key}.csv", index=False)
     pd.DataFrame(summary).T.to_csv(REPORTS / "phase6_summary.csv")
 
+    if UNIVERSE is not None and len(UNIVERSE) < 30:
+        # A small universe concentrates position weight, so one stock's crash
+        # can carry the entire result. Measured on the 10-symbol dev subset,
+        # ADANIENT alone contributed 93% of the edge while six of ten symbols
+        # never traded. The same subset reports +33% where the full universe
+        # reports -4.4%.
+        contrib = []
+        for sym in prices.columns:
+            sub = signals.xs(sym, level="symbol")
+            sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
+            ret = prices[sym].pct_change().fillna(0.0)
+            bh = (1 + ret).cumprod().iloc[-1]
+            st = (1 + ret * sub["in_position"].astype(float)).cumprod().iloc[-1]
+            contrib.append((sym, (st - bh) * 100, int((sub["action"] == "EXIT").sum())))
+        contrib.sort(key=lambda x: -abs(x[1]))
+        total = sum(abs(c[1]) for c in contrib) or 1.0
+        untraded = sum(1 for c in contrib if c[2] == 0)
+
+        print("\n" + "!" * 68)
+        print("SMALL-UNIVERSE WARNING -- do not read portfolio results from this run")
+        print("!" * 68)
+        print(f"  top contributor {contrib[0][0]} accounts for "
+              f"{abs(contrib[0][1]) / total:.0%} of the total edge")
+        print(f"  {untraded} of {len(contrib)} symbols never traded at all")
+        print("  Position weight is concentrated, so one stock's crash can carry")
+        print("  the whole result. Confirm on the full universe before concluding")
+        print("  anything about whether the strategy works.")
+
     print(f"\nwrote equity curves and trade logs -> {REPORTS}")
     return {"backtest": runs, "summary": summary}
 
@@ -615,7 +659,22 @@ def main() -> int:
     ap.add_argument("--phase", type=int, help="run one phase only")
     ap.add_argument("--from", dest="start", type=int, help="run from this phase onward")
     ap.add_argument("--list", action="store_true", help="list phases and exit")
+    ap.add_argument("--dev", action="store_true",
+                    help="run on the 10-symbol dev universe (seconds, not minutes)")
+    ap.add_argument("--symbols", type=str,
+                    help="comma-separated symbols, e.g. RELIANCE,TCS,ITC")
     args = ap.parse_args()
+
+    global UNIVERSE
+    if args.symbols:
+        UNIVERSE = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif args.dev:
+        UNIVERSE = list(CFG.data.dev_universe)
+    if UNIVERSE is not None:
+        print(f"universe restricted to {len(UNIVERSE)} symbols: {', '.join(UNIVERSE)}")
+        if len(UNIVERSE) < 20:
+            print("NOTE: cross-sectional features (breadth, correlation) are noisy on a\n"
+                  "      small universe. Confirm market-wide results on the full set.")
 
     if args.list:
         for n, (name, _) in sorted(PHASES.items()):

@@ -106,6 +106,50 @@ class DataConfig:
     #: window that spans it, so a 5-day slope would quietly cover 6 days.
     flag_flat_bars: bool = True
 
+    #: A 10-symbol subset for fast iteration. The full pipeline takes ~40s on
+    #: 96 symbols; this runs in a few seconds, which changes how often you are
+    #: willing to re-run it.
+    #:
+    #: Chosen to be REPRESENTATIVE, not arbitrary. A convenience slice
+    #: (alphabetical, or the first ten files) would concentrate sectors and
+    #: volatility profiles and give misleading results. These span:
+    #:
+    #:     annualised volatility 25.8% (HINDUNILVR) to 47.9% (ADANIENT)
+    #:     against a universe median of 34.4%
+    #:
+    #:   sectors : energy, IT, banking, FMCG x2, pharma, infra, auto, metals
+    #:   history : all have pre-2016 data, so the training window is full
+    #:   stress  : ADANIENT carries a real -30.3% day (Hindenburg, Feb 2023)
+    #:             and a -71.3% drawdown; TATASTEEL is the cyclical
+    #:
+    #: TWO CAVEATS, THE SECOND MORE SERIOUS THAN IT LOOKS.
+    #:
+    #: 1. Cross-sectional features are much noisier on ten names. Breadth moves
+    #:    in 10% steps, and average pairwise correlation is estimated from 45
+    #:    pairs instead of 4,560.
+    #:
+    #: 2. PORTFOLIO RESULTS ON A SMALL UNIVERSE ARE DOMINATED BY ONE NAME.
+    #:    Measured on this exact subset over 2021-2026:
+    #:
+    #:        total edge over buy-and-hold   +442pp
+    #:        ADANIENT alone                 +411pp   (93% of it)
+    #:        six of ten symbols              0pp     (never traded at all)
+    #:
+    #:    The full 96-symbol run reports -4.4% of capital; this subset reports
+    #:    +33%. Both are correct. The difference is entirely position weight --
+    #:    ADANIENT is 10% of a ten-stock portfolio and about 1% of the full one,
+    #:    so the same avoided crash is diluted tenfold.
+    #:
+    #: USE THE DEV SUBSET FOR: checking the pipeline runs, per-stock signal
+    #: inspection, and iterating on features.
+    #: DO NOT USE IT FOR: portfolio returns, drawdown comparisons, or any
+    #: conclusion about whether the strategy works. Confirm those on the full
+    #: universe, where no single name can carry the result.
+    dev_universe: tuple[str, ...] = (
+        "RELIANCE", "TCS", "HDFCBANK", "ITC", "ADANIENT",
+        "SUNPHARMA", "LT", "MARUTI", "HINDUNILVR", "TATASTEEL",
+    )
+
     #: Columns kept from the raw file. The underscore-prefixed metadata is
     #: retained deliberately -- `_source` records which vendor supplied each
     #: bar (kite vs upstox), which is two independent observations of one
