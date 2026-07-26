@@ -47,11 +47,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from qbeast_crash.config import DEFAULT_CONFIG, LabelConfig
+
 import numpy as np
 import pandas as pd
 
 __all__ = [
-    "CrashDefinition",
+    "LabelConfig",
     "EventTable",
     "forward_drawdown",
     "forward_runup",
@@ -69,52 +71,6 @@ LEAD_BUCKETS = (
     ("2-4 days", 2, 4),      # the target band
     ("0-1 days", 0, 1),      # coincident; still usable for a T+1 exit
 )
-
-
-@dataclass(frozen=True)
-class CrashDefinition:
-    """
-    What counts as a crash or a rally.
-
-    Stocks and the index need DIFFERENT thresholds, which is easy to miss.
-    Measured base rates for a forward 5-day drawdown on NIFTY100:
-
-                    -3%     14.49% of days
-                    -5%      5.44%          <- index default
-                    -6%      3.27%
-                   -10%      0.85%
-
-    The same -5% applied to individual stocks produces 7.6 "crashes" per stock
-    per year, which are ordinary pullbacks. See crash_threshold below.
-    """
-
-    horizon: int = 5              # trading days to look forward
-
-    #: Single-stock threshold. NOT the index threshold -- individual stocks are
-    #: roughly twice as volatile as the index, so an index-calibrated -5% is an
-    #: ordinary pullback for a stock, not a crash. Measured event counts over
-    #: 2021-2026 across 96 symbols:
-    #:
-    #:     threshold   onsets   per stock per year
-    #:        -5%       3,950         7.6      <- ordinary pullbacks
-    #:        -8%       1,479         2.9
-    #:       -10%         705         1.4      <- default
-    #:       -12%         350         0.7
-    #:       -20%          36         0.1
-    #:
-    #: Using -5% for stocks inflates the event count sevenfold and makes any
-    #: recall figure meaningless.
-    crash_threshold: float = -0.10
-    rally_threshold: float = 0.10
-
-    #: The index is less volatile, so it keeps the -5% cut, which occurs on
-    #: 5.44% of NIFTY100 days.
-    index_crash_threshold: float = -0.05
-
-    #: Events closer together than this merge into one. Without it, a single
-    #: crash produces a run of daily "events" and the hit rate is inflated by
-    #: counting the same episode many times.
-    min_gap: int = 10
 
 
 @dataclass
@@ -186,10 +142,10 @@ def _onsets(flags: pd.Series, min_gap: int) -> pd.DatetimeIndex:
 def label_events(
     close: pd.Series,
     symbol: str = "",
-    definition: CrashDefinition | None = None,
+    definition: LabelConfig | None = None,
 ) -> EventTable:
     """Label crash and rally events for one symbol. Never used in training."""
-    d = definition or CrashDefinition()
+    d = definition or DEFAULT_CONFIG.labels
 
     dd = forward_drawdown(close, d.horizon)
     ru = forward_runup(close, d.horizon)
@@ -210,7 +166,7 @@ def lead_time_report(
     signals: pd.Series,
     onsets: pd.DatetimeIndex,
     calendar: pd.DatetimeIndex,
-    max_lookback: int = 15,
+    max_lookback: int | None = None,
 ) -> dict:
     """
     How many trading days before each onset did the first signal fire?
@@ -232,6 +188,8 @@ def lead_time_report(
     forward-looking, so day t is the last day before the fall. In trading terms
     that is a one-day warning -- enough to exit at the next open.
     """
+    if max_lookback is None:
+        max_lookback = DEFAULT_CONFIG.labels.max_lookback
     positions = {d: i for i, d in enumerate(calendar)}
     fired = set(signals[signals.fillna(False)].index)
 
@@ -283,3 +241,8 @@ def lead_time_report(
         "median_lead": float(np.median(caught)) if caught else np.nan,
         "leads": leads,
     }
+
+
+#: Backwards-compatible alias -- the type now lives in config.py, which is
+#: the single source of truth for every threshold in the pipeline.
+CrashDefinition = LabelConfig

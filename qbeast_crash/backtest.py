@@ -66,14 +66,16 @@ slippage scales with the day's realised volatility.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from qbeast_crash.config import DEFAULT_CONFIG, CostConfig, TaxConfig
 
 import numpy as np
 import pandas as pd
 
 __all__ = [
-    "RateCard",
-    "TaxRates",
+    "CostConfig",
+    "TaxConfig",
     "Lot",
     "leg_cost",
     "apply_slippage",
@@ -84,80 +86,6 @@ __all__ = [
 
 #: Indian financial year runs 1 April to 31 March.
 FY_START_MONTH = 4
-
-#: Budget 2024, effective 23 July 2024.
-_CG_CHANGE = dt.date(2024, 7, 23)
-
-#: NSE transaction charge revision, effective 1 October 2024.
-_TXN_CHANGE = dt.date(2024, 10, 1)
-
-
-@dataclass(frozen=True)
-class RateCard:
-    """
-    NSE equity DELIVERY cost stack. All rates are fractions of turnover unless
-    named `_flat`.
-
-    Delivery, not intraday: STT applies to BOTH legs at 0.1%, which is the
-    single largest component and the one most often modelled wrongly.
-    """
-
-    #: Zero at discount brokers for delivery. Set higher to model a full-service
-    #: broker.
-    brokerage_pct: float = 0.0
-
-    sebi_fee_pct: float = 0.000001          # Rs 10 per crore
-    stamp_duty_pct: float = 0.00015         # 0.015%, BUY side only
-    stt_pct: float = 0.001                  # 0.1%, BOTH legs on delivery
-    gst_pct: float = 0.18
-
-    #: Depository charge per scrip on the sell side. Quoted GST-inclusive by
-    #: most brokers, so it is added after GST rather than into its base.
-    dp_charge_flat: float = 15.34
-
-    #: Baseline slippage in quiet conditions, scaled up by realised volatility.
-    base_slippage_pct: float = 0.0005       # 5 bps
-
-    #: Slippage multiplier per unit of volatility ratio above 1. A day twice as
-    #: volatile as normal pays roughly twice the baseline.
-    slippage_vol_beta: float = 1.0
-
-    #: Cap so a single wild day cannot produce an absurd fill.
-    max_slippage_pct: float = 0.01
-
-    def exchange_txn_pct(self, on: dt.date) -> float:
-        """NSE transaction charge, revised 1 October 2024."""
-        return 0.0000297 if on >= _TXN_CHANGE else 0.0000325
-
-
-@dataclass(frozen=True)
-class TaxRates:
-    """
-    Capital gains on listed equity with STT paid.
-
-    Short-term is under 12 months (Section 111A); long-term is 12 months or more
-    (Section 112A) and carries an annual exemption.
-    """
-
-    stcg_before: float = 0.15
-    stcg_after: float = 0.20
-    ltcg_before: float = 0.10
-    ltcg_after: float = 0.125
-    ltcg_exemption_before: float = 100_000.0
-    ltcg_exemption_after: float = 125_000.0
-
-    def stcg(self, on: dt.date) -> float:
-        return self.stcg_after if on >= _CG_CHANGE else self.stcg_before
-
-    def ltcg(self, on: dt.date) -> float:
-        return self.ltcg_after if on >= _CG_CHANGE else self.ltcg_before
-
-    def ltcg_exemption(self, on: dt.date) -> float:
-        return (
-            self.ltcg_exemption_after if on >= _CG_CHANGE
-            else self.ltcg_exemption_before
-        )
-
 
 @dataclass
 class Lot:
@@ -179,7 +107,7 @@ def apply_slippage(
     price: float,
     side: str,
     vol_ratio: float = 1.0,
-    rates: RateCard | None = None,
+    rates: CostConfig | None = None,
 ) -> float:
     """
     Fill price after slippage. Buy pays more, sell receives less.
@@ -191,7 +119,7 @@ def apply_slippage(
     this strategy trades only on unusual days. Flat slippage would understate
     cost on every single trade it makes.
     """
-    r = rates or RateCard()
+    r = rates or DEFAULT_CONFIG.costs
     ratio = 1.0 if not np.isfinite(vol_ratio) else max(vol_ratio, 0.0)
     slip = r.base_slippage_pct * (1.0 + r.slippage_vol_beta * max(ratio - 1.0, 0.0))
     slip = min(slip, r.max_slippage_pct)
@@ -208,7 +136,7 @@ def leg_cost(
     price: float,
     qty: int,
     on: dt.date,
-    rates: RateCard | None = None,
+    rates: CostConfig | None = None,
 ) -> dict:
     """
     Full cost stack for one leg, in rupees.
@@ -221,7 +149,7 @@ def leg_cost(
     if side not in ("buy", "sell"):
         raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
-    r = rates or RateCard()
+    r = rates or DEFAULT_CONFIG.costs
     on = pd.Timestamp(on).date() if not isinstance(on, dt.date) else on
     notional = price * qty
 
@@ -232,6 +160,7 @@ def leg_cost(
 
     stamp = notional * r.stamp_duty_pct if side == "buy" else 0.0
     stt = notional * r.stt_pct                       # BOTH legs on delivery
+    # Advertised GST-inclusive, so added AFTER gst rather than into its base.
     dp = r.dp_charge_flat if side == "sell" else 0.0
 
     total = brokerage + exchange + sebi + gst + stamp + stt + dp
@@ -244,7 +173,7 @@ def leg_cost(
 
 def capital_gains(
     realised: pd.DataFrame,
-    tax: TaxRates | None = None,
+    tax: TaxConfig | None = None,
 ) -> pd.DataFrame:
     """
     Capital gains tax by financial year.
@@ -258,13 +187,13 @@ def capital_gains(
     long-term gains, within a year. Carry-forward across years is NOT modelled
     -- it would understate the drag, so this errs on the conservative side.
     """
-    t = tax or TaxRates()
+    t = tax or DEFAULT_CONFIG.tax
     if realised.empty:
         return pd.DataFrame(columns=["fy", "stcg_gain", "ltcg_gain", "tax"])
 
     df = realised.copy()
     df["fy"] = df["sold_on"].map(financial_year)
-    df["long_term"] = df["holding_days"] >= 365
+    df["long_term"] = df["holding_days"] >= t.long_term_days
 
     rows = []
     for fy, block in df.groupby("fy"):
@@ -285,10 +214,10 @@ def capital_gains(
 def run_backtest(
     prices: pd.DataFrame,
     positions: pd.DataFrame,
-    capital: float = 1_000_000.0,
+    capital: float | None = None,
     vol_ratio: pd.DataFrame | None = None,
-    rates: RateCard | None = None,
-    tax: TaxRates | None = None,
+    rates: CostConfig | None = None,
+    tax: TaxConfig | None = None,
 ) -> dict:
     """
     Sleeve-based portfolio simulation.
@@ -306,7 +235,8 @@ def run_backtest(
     Returns a dict with the equity curve, trade log, realised gains, tax by
     financial year, and a cost breakdown.
     """
-    r = rates or RateCard()
+    r = rates or DEFAULT_CONFIG.costs
+    capital = DEFAULT_CONFIG.portfolio.initial_capital if capital is None else capital
     symbols = [s for s in positions.columns if s in prices.columns]
     dates = prices.index
     sleeve_capital = capital / len(symbols)
@@ -355,7 +285,7 @@ def run_backtest(
             elif held == 0 and want and cash[sym] > 0:
                 fill = apply_slippage(price, "buy", vol_at(sym, i), r)
                 # Reserve headroom for costs so the sleeve cannot go negative.
-                qty = int(cash[sym] * 0.995 // fill)
+                qty = int(cash[sym] * (1.0 - DEFAULT_CONFIG.portfolio.cash_buffer) // fill)
                 if qty > 0:
                     cost = leg_cost("buy", fill, qty, day, r)
                     outlay = fill * qty + cost["total_cost"]
@@ -441,3 +371,8 @@ def _apply_tax(equity: pd.Series, tax_table: pd.DataFrame) -> pd.Series:
         running += float(row["tax"])
         out.loc[out.index >= pay_date] = equity.loc[out.index >= pay_date] - running
     return out
+
+
+#: Backwards-compatible aliases -- these types now live in config.py.
+RateCard = CostConfig
+TaxRates = TaxConfig

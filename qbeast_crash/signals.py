@@ -45,7 +45,7 @@ Re-entry rules are therefore configurable and measured rather than assumed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from qbeast_crash.config import DEFAULT_CONFIG, SignalConfig
 
 import numpy as np
 import pandas as pd
@@ -59,43 +59,6 @@ __all__ = [
     "performance",
     "signal_strength",
 ]
-
-
-@dataclass(frozen=True)
-class SignalConfig:
-    """
-    Thresholds and the whipsaw controls.
-
-    The whipsaw controls are not polish. Every round trip pays brokerage, STT,
-    stamp duty, GST and slippage, and converts a long-term holding into a
-    short-term one for tax. A rule that is right slightly more often than it is
-    wrong can still lose money if it trades enough.
-    """
-
-    #: Exit when intensity clears this AND the trend phase is an accelerating
-    #: decline. 0.99 measured 110x lift at a one-day horizon; 0.95 fires ~7x
-    #: more often for materially less edge.
-    exit_intensity: float = 0.99
-
-    #: Consecutive confirming days before acting. 1 = act immediately, which is
-    #: what the fast-reaction framing wants -- the edge is concentrated at H=1
-    #: and decays fast, so waiting for confirmation spends the entire advantage.
-    exit_persistence: int = 1
-
-    #: Re-entry threshold, used by the intensity-based rules.
-    reentry_intensity: float = 0.95
-
-    #: Minimum sessions held before an exit may fire. Stops an entry and exit
-    #: landing on consecutive days.
-    min_hold: int = 3
-
-    #: Minimum sessions in cash before re-entry. The dominant whipsaw guard.
-    cooldown: int = 3
-
-    #: Hard cap: force re-entry after this many sessions in cash regardless of
-    #: signal. Being long is the default state, and an indefinite cash position
-    #: is a bet the model was never asked to make.
-    max_cash_days: int = 20
 
 
 class ReentryRule:
@@ -165,7 +128,7 @@ def generate_signals(
     time machine. `in_position` therefore reflects the state you would actually
     have been in, and returns should be applied to it directly.
     """
-    cfg = config or SignalConfig()
+    cfg = config or DEFAULT_CONFIG.signals
     n = len(frame)
 
     intensity = frame["intensity"].to_numpy()
@@ -227,8 +190,8 @@ def generate_signals(
 
 def market_signal(
     market: pd.DataFrame,
-    breadth_threshold: float = 75.0,
-    median_slope_threshold: float = -1.5,
+    breadth_threshold: float | None = None,
+    median_slope_threshold: float | None = None,
 ) -> pd.Series:
     """
     Market-wide de-risking flag.
@@ -244,9 +207,12 @@ def market_signal(
         2016-02-11     90.1%         -0.94    Feb-2016 selloff
         2022-09-26     87.2%         -0.67    Fed / GBP crisis
     """
+    cfg = DEFAULT_CONFIG.signals
+    breadth = cfg.market_breadth_threshold if breadth_threshold is None else breadth_threshold
+    slope = cfg.market_slope_threshold if median_slope_threshold is None else median_slope_threshold
     return (
-        (market["breadth_decline"] >= breadth_threshold)
-        & (market["median_slope_z"] <= median_slope_threshold)
+        (market["breadth_decline"] >= breadth)
+        & (market["median_slope_z"] <= slope)
     ).fillna(False)
 
 
