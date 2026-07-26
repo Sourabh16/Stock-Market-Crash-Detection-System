@@ -45,6 +45,7 @@ from qbeast_crash.data import (
     run_quality_gate,
     trading_calendar,
 )
+from qbeast_crash.backtest import RateCard, TaxRates, run_backtest
 from qbeast_crash.labels import LEAD_BUCKETS, CrashDefinition, label_events, lead_time_report
 from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
 from qbeast_crash.signals import (
@@ -477,12 +478,135 @@ def phase_5(ctx: dict) -> dict:
     return {"signals": panel, "reentry_rule": best, "market_flag": mkt}
 
 
+# =====================================================================
+# Phase 6 -- backtest with real costs and tax
+# =====================================================================
+def phase_6(ctx: dict) -> dict:
+    """
+    Apply the NSE delivery cost stack and Indian capital gains tax.
+
+    At 0.4 trades per symbol per year, brokerage cannot meaningfully erode
+    this strategy. The interesting question is TAX: every crash exit converts a
+    long-term holding into a short-term one, moving the rate from 12.5% to 20%.
+    """
+    _rule("PHASE 6  Backtest with costs and tax")
+
+    signals, frames, calendar = ctx["signals"], ctx["frames"], ctx["calendar"]
+    w = CFG.windows
+    oos = calendar[(calendar >= pd.Timestamp(w.backtest_start))
+                   & (calendar <= pd.Timestamp(w.backtest_end))]
+    years = (oos[-1] - oos[0]).days / 365.25
+    capital = 1_000_000.0
+
+    prices = pd.DataFrame(
+        {s: f["close"].astype(float) for s, f in frames.items()}
+    ).reindex(oos)
+
+    pos = signals["in_position"].unstack("symbol").reindex(
+        index=oos, columns=prices.columns).fillna(True)
+
+    # Volatility ratio drives slippage: this strategy trades only on unusual
+    # days, when spreads are genuinely wider.
+    vol = ctx["features"]["vol_ratio"].unstack("symbol").reindex(
+        index=oos, columns=prices.columns)
+
+    always = pd.DataFrame(True, index=oos, columns=prices.columns)
+
+    print(f"capital Rs {capital:,.0f}  |  {len(prices.columns)} symbols  "
+          f"|  {len(oos)} sessions\n")
+
+    runs = {}
+    for label, p in (("strategy", pos), ("buy & hold", always)):
+        runs[label] = run_backtest(prices, p, capital, vol_ratio=vol,
+                                   rates=RateCard(), tax=TaxRates())
+
+    # Equity is already net of transaction costs -- they are deducted inside the
+    # engine at each fill. The tax column is the additional deduction.
+    print(f"{'':14s}{'CAGR net of':>13s}{'CAGR after':>12s}{'':>3s}"
+          f"{'maxDD':>9s}{'trades':>8s}{'costs Rs':>11s}{'tax Rs':>11s}")
+    print(f"{'':14s}{'costs':>13s}{'tax':>12s}")
+    summary = {}
+    for label, res in runs.items():
+        eq, eq_t = res["equity"], res["equity_after_tax"]
+        net_costs = (eq.iloc[-1] / capital) ** (1 / years) - 1
+        net_all = (eq_t.iloc[-1] / capital) ** (1 / years) - 1
+        dd = (eq_t / eq_t.cummax() - 1).min()
+        print(f"{label:14s}{net_costs:12.2%}{net_all:12.2%}{'':>3s}{dd:9.1%}"
+              f"{len(res['trades']):8d}{res['total_costs']:11,.0f}"
+              f"{res['total_tax']:11,.0f}")
+        summary[label] = {"cagr_net_costs": net_costs, "cagr_net_all": net_all,
+                          "maxdd": dd, "trades": len(res["trades"]),
+                          "costs": res["total_costs"], "tax": res["total_tax"],
+                          "tax_liquidated": res["total_tax_liquidated"],
+                          "deferred_tax": res["deferred_tax"]}
+
+    s_, b_ = summary["strategy"], summary["buy & hold"]
+    print(f"\ndrawdown: buy & hold {b_['maxdd']:.1%} -> strategy {s_['maxdd']:.1%}"
+          f"  ({(s_['maxdd'] - b_['maxdd']) * 100:+.1f} pp)")
+    print(f"cost drag: Rs {s_['costs'] - b_['costs']:,.0f} extra over {years:.1f} years "
+          f"({(s_['costs'] - b_['costs']) / capital / years * 100:.3f}% of capital per year)")
+
+    # ---- the tax question -------------------------------------------
+    print("\nTAX: does exiting convert long-term gains into short-term?")
+    for label, res in runs.items():
+        rl = res["realised"]
+        if rl.empty:
+            print(f"  {label:12s} no realised gains")
+            continue
+        short = (rl["holding_days"] < 365)
+        print(f"  {label:12s} {len(rl):4d} sales   "
+              f"{short.mean():5.1%} short-term   "
+              f"Rs {res['total_tax']:>10,.0f} tax   "
+              f"({res['total_tax'] / capital * 100:.2f}% of capital)")
+
+    print("\n  Buy & hold never sells, so on a realised basis it pays no tax at all.")
+    print("  That is deferral, not saving -- it ends the period holding an")
+    print("  unrealised liability. Liquidating both books at the final close:")
+    print(f"\n{'':14s}{'tax paid':>12s}{'deferred':>12s}{'total if':>12s}")
+    print(f"{'':14s}{'as we go':>12s}{'liability':>12s}{'liquidated':>12s}")
+    for label, res in runs.items():
+        print(f"  {label:12s}{res['total_tax']:12,.0f}{res['deferred_tax']:12,.0f}"
+              f"{res['total_tax_liquidated']:12,.0f}")
+
+    extra = s_["tax_liquidated"] - b_["tax_liquidated"]
+    print(f"\n  like-for-like tax difference: Rs {extra:,.0f} "
+          f"({extra / capital * 100:+.2f}% of capital)")
+
+    # The only comparison that settles it: what you walk away with.
+    print(f"\n{'':14s}{'terminal':>13s}{'tax if':>13s}{'AFTER-TAX':>13s}{'CAGR':>9s}")
+    print(f"{'':14s}{'equity':>13s}{'liquidated':>13s}{'WEALTH':>13s}")
+    for label, res in runs.items():
+        term = res["equity"].iloc[-1]
+        after = term - res["total_tax_liquidated"]
+        print(f"  {label:12s}{term:13,.0f}{res['total_tax_liquidated']:13,.0f}"
+              f"{after:13,.0f}{(after / capital) ** (1 / years) - 1:9.2%}")
+
+    s_after = runs["strategy"]["equity"].iloc[-1] - s_["tax_liquidated"]
+    b_after = runs["buy & hold"]["equity"].iloc[-1] - b_["tax_liquidated"]
+    print(f"\n  after-tax difference: Rs {s_after - b_after:,.0f} "
+          f"({(s_after - b_after) / capital * 100:+.2f}% of capital)")
+    print(f"  short-term share of strategy sales: "
+          f"{(runs['strategy']['realised']['holding_days'] < 365).mean():.1%}")
+
+    for label, res in runs.items():
+        key = label.replace(" & ", "_").replace(" ", "_")
+        res["equity_after_tax"].to_frame("equity").to_parquet(
+            DATA_PROCESSED / f"equity_{key}.parquet")
+        if len(res["trades"]):
+            res["trades"].to_csv(REPORTS / f"phase6_trades_{key}.csv", index=False)
+    pd.DataFrame(summary).T.to_csv(REPORTS / "phase6_summary.csv")
+
+    print(f"\nwrote equity curves and trade logs -> {REPORTS}")
+    return {"backtest": runs, "summary": summary}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
     3: ("Isolation Forest + intensity", phase_3),
     4: ("Labels + lead time", phase_4),
     5: ("Signal generation", phase_5),
+    6: ("Backtest with costs", phase_6),
 }
 
 
