@@ -171,8 +171,10 @@ approach fails this check, so the guard is proven to bite.
 ## Getting started
 
 ```bash
-pip install numpy pandas pyarrow scikit-learn pytest
+pip install -r requirements.txt
 ```
+
+Requires Python 3.12+ — the codebase uses PEP 604 union syntax throughout.
 
 Price data is **not tracked in git**. Place per-symbol CSVs as:
 

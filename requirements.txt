@@ -1,0 +1,34 @@
+# QBEAST — Stock Market Crash Detection System
+#
+#     pip install -r requirements.txt
+#
+# Requires Python 3.12 or later. The codebase uses PEP 604 union syntax
+# (`int | None`) and the `X | Y` form in dataclass annotations, neither of
+# which parses on 3.9 or earlier.
+#
+# Lower bounds are the versions this project was developed and tested against,
+# not the oldest that could work. They are floors rather than pins so security
+# patches install freely; if a future release breaks something, pin the exact
+# version here and record why.
+
+# --- core ------------------------------------------------------------------
+numpy>=2.0                # sliding_window_view is load-bearing in features.py
+pandas>=2.2               # tested on 3.0.3; needs MultiIndex .xs and groupby
+scikit-learn>=1.5         # IsolationForest only
+
+# --- storage ---------------------------------------------------------------
+# Every intermediate artefact is parquet. CSV would work but loses dtypes,
+# and the feature table is 468,266 rows — parquet reads it in well under a
+# second, CSV takes several.
+pyarrow>=16.0
+
+# --- charts ----------------------------------------------------------------
+# Used headlessly (matplotlib.use("Agg")), so no display or GUI backend is
+# needed. The dashboard's interactive charts are Plotly loaded from a CDN in
+# the browser, so plotly is NOT a Python dependency here.
+matplotlib>=3.8
+
+# --- tests -----------------------------------------------------------------
+# 183 tests, several of which are the causality guards that catch look-ahead
+# bias. Worth installing even if you only intend to run the pipeline.
+pytest>=8.0

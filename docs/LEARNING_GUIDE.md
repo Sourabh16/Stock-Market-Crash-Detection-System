@@ -20,7 +20,7 @@ python3 --version
 ```
 
 ```bash
-python3 -m pip install numpy pandas pyarrow scikit-learn pytest
+python3 -m pip install -r requirements.txt
 ```
 
 **PyCharm setup that will save you pain:**
