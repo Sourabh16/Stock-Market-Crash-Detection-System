@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import pandas as pd
 
 from qbeast_crash.config import (
@@ -44,6 +45,7 @@ from qbeast_crash.data import (
     run_quality_gate,
     trading_calendar,
 )
+from qbeast_crash.labels import LEAD_BUCKETS, CrashDefinition, label_events, lead_time_report
 from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
 from qbeast_crash.features import (
     FEATURE_COLUMNS,
@@ -202,11 +204,126 @@ def phase_3(ctx: dict) -> dict:
     return {"detector": detector, "scored": scored}
 
 
+# =====================================================================
+# Phase 4 -- labels and lead time  (the go/no-go gate)
+# =====================================================================
+def phase_4(ctx: dict) -> dict:
+    """
+    Measure how many trading days BEFORE each crash the signal fired.
+
+    Everything before this measures whether the signal fires when crashes are
+    near. This measures how early -- which is the actual requirement.
+    """
+    _rule("PHASE 4  Labels and lead time")
+
+    scored, frames, calendar = ctx["scored"], ctx["frames"], ctx["calendar"]
+    w = CFG.windows
+    defn = CrashDefinition()
+    oos = calendar[(calendar >= pd.Timestamp(w.backtest_start))
+                   & (calendar <= pd.Timestamp(w.backtest_end))]
+
+    print(f"crash definition: forward {defn.horizon}-day drawdown <= "
+          f"{defn.crash_threshold:.0%}, events merged within {defn.min_gap} days")
+    print(f"out-of-sample window: {oos[0].date()} to {oos[-1].date()} "
+          f"({len(oos)} sessions)\n")
+
+    rules = {
+        "intensity >= 0.99 + AccelDecline": lambda f: (f["intensity"] >= 0.99)
+            & (f["phase"] == "AcceleratingDecline"),
+        "intensity >= 0.95 + AccelDecline": lambda f: (f["intensity"] >= 0.95)
+            & (f["phase"] == "AcceleratingDecline"),
+        "intensity >= 0.99 (no direction)": lambda f: f["intensity"] >= 0.99,
+    }
+
+    events = {}
+    for sym, frame in frames.items():
+        ev = label_events(frame["close"].astype(float), sym, defn)
+        onsets = ev.crash_onsets[(ev.crash_onsets >= oos[0]) & (ev.crash_onsets <= oos[-1])]
+        if len(onsets):
+            events[sym] = onsets
+    total = sum(len(v) for v in events.values())
+    print(f"crash onsets across {len(events)} symbols: {total} "
+          f"({total / len(frames) / 5.4:.1f} per stock per year)\n")
+
+    # A RANDOM signal with the same firing rate is the only honest baseline.
+    # Crash events are frequent enough that a rule firing often will land near
+    # one by chance, so raw recall on its own says nothing about skill.
+    rng = np.random.default_rng(0)
+
+    def measure(rule, randomise=False):
+        caught = n_ev = n_sig = fa = 0
+        leads = []
+        for sym, onsets in events.items():
+            sub = scored.xs(sym, level="symbol")
+            sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
+            sig = rule(sub)
+            if randomise:
+                k = int(sig.sum())
+                arr = np.zeros(len(sub), dtype=bool)
+                if k:
+                    arr[rng.choice(len(sub), k, replace=False)] = True
+                sig = pd.Series(arr, index=sub.index)
+            rep = lead_time_report(sig, onsets, oos)
+            caught += rep["n_caught"]; n_ev += rep["n_events"]
+            n_sig += rep["n_signals"]; fa += rep["false_alarms"]
+            leads += [x for x in rep["leads"] if x is not None]
+        return {
+            "signals": n_sig, "events": n_ev, "caught": caught,
+            "recall": caught / max(n_ev, 1),
+            "median_lead": float(np.median(leads)) if leads else float("nan"),
+            "fa_per_sym_yr": fa / len(frames) / 5.4,
+        }
+
+    print("EARLY WARNING vs A RANDOM SIGNAL OF THE SAME FREQUENCY")
+    print(f"{'rule':34s}{'signals':>8s}{'recall':>9s}{'random':>9s}{'skill':>8s}{'FA/sym/yr':>11s}")
+    rows = []
+    for name, rule in rules.items():
+        real = measure(rule)
+        rand = measure(rule, randomise=True)
+        skill = real["recall"] / max(rand["recall"], 1e-9)
+        print(f"{name:34s}{real['signals']:8d}{real['recall']:9.1%}"
+              f"{rand['recall']:9.1%}{skill:7.2f}x{real['fa_per_sym_yr']:11.2f}")
+        rows.append({"rule": name, **real, "random_recall": rand["recall"], "skill": skill})
+
+    # Horizon decay -- where the information actually is.
+    print("\nP(drawdown <= -10% within H days), signal = intensity 0.99 + AccelDecline")
+    print(f"{'H':>3s}{'base rate':>11s}{'given signal':>14s}{'lift':>9s}")
+    closes = {s: f["close"].astype(float) for s, f in frames.items()}
+    blocks = []
+    for sym, close in closes.items():
+        sub = scored.xs(sym, level="symbol").reindex(close.index)
+        v = close.to_numpy()
+        cols = {f"dd{H}": np.array(
+            [(v[i + 1:i + 1 + H].min() / v[i] - 1) if i + 1 + H <= len(v) else np.nan
+             for i in range(len(v))]) for H in (1, 2, 3, 5, 10)}
+        blk = pd.DataFrame(cols, index=close.index)
+        blk["intensity"] = sub["intensity"]; blk["phase"] = sub["phase"]
+        blocks.append(blk.loc[str(w.backtest_start):str(w.backtest_end)])
+    allc = pd.concat(blocks)
+    sig = (allc["intensity"] >= 0.99) & (allc["phase"] == "AcceleratingDecline")
+    decay = []
+    for H in (1, 2, 3, 5, 10):
+        col = f"dd{H}"
+        base = (allc[col] <= -0.10).mean()
+        given = (allc.loc[sig, col] <= -0.10).mean()
+        print(f"{H:3d}{base:10.2%}{given:14.2%}{given / base:8.1f}x")
+        decay.append({"horizon": H, "base": base, "given_signal": given, "lift": given / base})
+
+    print(f"\nmedian same-day return on signal days: {allc.loc[sig, 'dd1'].median():+.2%}"
+          f"   (all days {allc['dd1'].median():+.2%})")
+
+    table = pd.DataFrame(rows).set_index("rule")
+    pd.DataFrame(decay).to_csv(REPORTS / "phase4_horizon_decay.csv", index=False)
+    table.to_csv(REPORTS / "phase4_lead_time.csv")
+    print(f"\nwrote {REPORTS / 'phase4_lead_time.csv'}")
+    return {"lead_time": table, "events": events}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
     3: ("Isolation Forest + intensity", phase_3),
-    # 4: ("Labels + lead time", phase_4),
+    4: ("Labels + lead time", phase_4),
 }
 
 

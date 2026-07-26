@@ -833,6 +833,236 @@ const PHASES = {
       return c;
     },
   },
+
+  phase3: {
+    slug: "Phase3_Isolation_Forest",
+    docTitle: "QBEAST Phase 3 — Isolation Forest and Anomaly Intensity",
+    runningHead: "QBEAST · Phase 3 — Isolation Forest",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 3",
+        title: "Isolation Forest & Anomaly Intensity",
+        subtitle: "Fitting the detector, and turning its scores into a scale that means something",
+        status: "STATUS: COMPLETE — 86 tests passing",
+        meta: [
+          "One model fitted on 106,157 pooled symbol-days",
+          "328 High-band alerts across 128,737 out-of-sample symbol-days",
+          "Strongest signal: 38.4% crash rate against an 11.0% base rate (3.48×)",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      // ------------------------------------------------------- 1
+      c.push(
+        H1("1. How Isolation Forest works"),
+        P("Most anomaly detectors work by building a model of what is normal and then measuring how far each point sits from it. Isolation Forest does something stranger and much cheaper: it never models normality at all."),
+        P("It builds many random trees. At each step it picks a feature at random, picks a split value at random within that feature's range, and cuts the data in two. It repeats until every point sits alone in its own leaf, and then counts how many cuts each point needed."),
+        Callout("The insight", [
+          "Outliers are isolated quickly. A point sitting far from everything else gets separated after a handful of random cuts, because almost any cut you make happens to fall between it and the crowd.",
+          "A point buried inside a dense cluster needs many cuts before it is alone, because most random cuts land elsewhere.",
+          "So the average number of cuts — the path length — is itself the anomaly measure. Short path means anomalous. Nothing else has to be computed.",
+        ]),
+        P("This is why the method is fast, why it needs no assumption about the shape of the data, and why it scales comfortably to 468,266 rows."),
+
+        H2("1.1 Unsupervised, and what that costs"),
+        P("The model is never shown a labelled crash. It has no notion of good or bad, only of usual and unusual. That is a genuine advantage: crashes are rare, and a supervised model trained on the handful of crashes in Indian market history would have almost nothing to learn from."),
+        P("But it has a cost that shapes every downstream decision, and it is worth stating bluntly."),
+        Callout("Isolation Forest is direction-blind", [
+          "It flags UNUSUAL, not UNUSUALLY BAD. A violent rally is exactly as anomalous as a violent crash, because both are equally far from an ordinary Tuesday.",
+          "So the anomaly score alone can never produce a buy or a sell signal. It can only say that something is happening.",
+          "Direction comes from slope. Building-versus-exhausting comes from acceleration. That is the entire reason those features exist, and why the architecture has three parts rather than one.",
+        ]),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 2
+      c.push(
+        H1("2. Anomaly intensity"),
+        H2("2.1 The problem with the raw score"),
+        P("The score that comes out of the model is not comparable between one fitted model and another. Its scale shifts with the size of the training window, with how many trees were built, and with which random cuts those trees happened to make."),
+        P("That would not matter if we only ever fitted one model. But Phase 7 compares four retraining schemes against each other, and a fixed cutoff on the raw score would mean four different things under four schemes. The comparison would be measuring the scoring scale rather than the schemes."),
+
+        H2("2.2 The fix: percentile against the training distribution"),
+        ...Code([
+          "intensity(x) = fraction of TRAINING rows that scored lower than x",
+          "",
+          "  intensity = 0.99   more unusual than 99% of training days",
+          "  intensity = 0.50   a perfectly ordinary day",
+        ]),
+        P("Three properties follow, and all three are needed:"),
+        Num("It means the same thing under every fit, which is what makes the retraining comparison valid."),
+        Num("It means the same thing for every stock, so one global threshold serves all 96 symbols rather than 96 hand-tuned ones."),
+        Num("It is directly interpretable as an alert budget. A 0.99 cut implies roughly one alert per hundred days, before any direction filter is applied."),
+        P("A test asserts this property directly: two detectors with different settings must each select about one percent of their own training data at intensity 0.99 or above. A raw-score threshold would not."),
+
+        H2("2.3 Bands"),
+        Tbl(["Band", "Intensity", "Intended use"], [
+          ["High", "0.99 and above", "Act, if slope and acceleration confirm"],
+          ["Moderate", "0.95 to 0.99", "Do not act — watch for 3 to 5 days and see how it resolves"],
+          ["Low", "0.90 to 0.95", "Record only"],
+        ], [1500, 2300, 5200]),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 3
+      c.push(
+        H1("3. Design decisions"),
+
+        H2("3.1 One pooled model, not one per stock"),
+        P("The detector is fitted on all 96 symbols together rather than separately per symbol."),
+        P("A per-symbol model would see only a few hundred training rows each. Worse, it would learn each stock's own quiet periods as that stock's normal — so a permanently turbulent name would have a high bar for anomaly and a placid one a low bar. The scores would no longer be comparable across the universe, which destroys the entire point of a cross-sectional signal: choosing which stocks to act on requires that a 0.99 for one stock means what a 0.99 means for another."),
+
+        H2("3.2 Missing rows are dropped, never imputed"),
+        P("Isolation Forest cannot consume missing values. The usual response is to fill them with a column mean, and here that would be actively harmful."),
+        P("Every imputed row would carry the same fabricated values. The model would see a large, perfectly dense cluster of identical points and learn that this configuration is extremely normal — the single most normal thing in the dataset. Incomplete rows are therefore excluded from fitting and score as missing, with the row itself preserved so nothing downstream silently shifts."),
+
+        H2("3.3 What is persisted, and why both halves matter"),
+        P("Saving the fitted forest alone would be useless, because the forest cannot produce intensity by itself — the scale lives in the training score distribution. Both are stored together."),
+        P("There is a second reason. Storing the training distribution alongside the model means a later robustness experiment can be re-run without repeating the backtest, which turns a day of computation into a minute of it."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 4
+      c.push(
+        H1("4. A parameter that does not do what its name suggests"),
+        RichP([
+          { text: "Isolation Forest exposes a " }, { text: "contamination", code: true },
+          { text: " parameter, usually documented as the expected proportion of anomalies in the data. It is entirely natural to reach for it and set it to five percent, and much of the literature suggests exactly that." },
+        ]),
+        P("Measured across every value from 0.001 to 0.2, the raw anomaly scores are bit-for-bit identical."),
+        Tbl(["contamination", "scores identical?", "internal offset", "predict() flags"], [
+          ["0.001", "yes", "-0.6012", "0.1%"],
+          ["0.01", "yes", "-0.5644", "1.0%"],
+          ["0.05", "yes", "-0.5242", "5.0%"],
+          ["0.20", "yes", "-0.4800", "20.0%"],
+        ], [2400, 2400, 2200, 2000]),
+        P("Contamination does not affect tree building at all. It sets only an internal offset used to convert scores into a binary in-or-out label. It is a labelling knob, not a learning one."),
+        RichP([
+          { text: "This pipeline never uses that binary label, so contamination never enters the calculation. That is deliberate. Setting contamination amounts to " },
+          { text: "asserting", italics: true },
+          { text: " what fraction of history was a crash — and then being scored against your own assertion. The training-percentile mapping replaces the assumption with a measurement." },
+        ]),
+        P("The five percent intuition is still sound. It simply belongs to the intensity THRESHOLD rather than to the model. Cutting at 0.95 means acting on the most unusual five percent of days."),
+        Callout("A pleasing coincidence", [
+          "Measured on the index, a forward five-day drawdown of five percent or worse occurs on 5.44% of days.",
+          "So the conventional five percent figure and an absolute five percent crash definition agree almost exactly — arrived at from completely different directions. That agreement is a useful cross-check on both numbers.",
+        ], "good"),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 5
+      c.push(
+        H1("5. Two corrections to earlier claims"),
+        P("Both were stated confidently in earlier phases and both turned out to be wrong when measured. They are recorded here rather than quietly fixed, because the reasoning matters more than the conclusion."),
+
+        H2("5.1 max_samples is not the parameter that matters"),
+        P("Earlier documentation described max_samples — the subsample each tree isolates from — as the parameter that genuinely needed tuning, in contrast to contamination. Measured across a 64-fold range:"),
+        Tbl(["max_samples", "signals", "P(crash)", "lift"], [
+          ["64", "445", "24.0%", "2.18x"],
+          ["128", "411", "24.6%", "2.23x"],
+          ["256", "444", "24.5%", "2.22x"],
+          ["512", "429", "24.9%", "2.26x"],
+          ["1024", "420", "24.5%", "2.22x"],
+          ["4096", "399", "25.3%", "2.29x"],
+        ], [2200, 2000, 2400, 2400]),
+        P("Lift moves from 2.18 to 2.29 across the whole range. It barely matters on this data. The default of 256 is kept, now on evidence rather than on assertion."),
+
+        H2("5.2 Volatility purging is not the right baseline"),
+        P("Phase 2 found something striking: a detector trained on all market history through 2020 fired ZERO alerts across 1,344 out-of-sample days. Having been shown 2008 and March 2020, it had learned that catastrophe is ordinary. Volatility purging — withholding the most turbulent days from training — restored firing, and the Phase 2 documentation concluded that purging should become the default."),
+        P("On the per-stock model that conclusion is wrong. Measured on 2021 to 2026, signal defined as intensity 0.99 or above combined with AcceleratingDecline, against a base crash rate of 11.0%:"),
+        Tbl(["Purge quantile", "Training rows", "Signals", "P(crash)", "Lift"], [
+          ["none", "106,157", "125", "38.4%", "3.48x"],
+          ["0.99", "105,006", "205", "29.3%", "2.65x"],
+          ["0.95", "100,726", "420", "24.8%", "2.24x"],
+          ["0.90", "95,329", "444", "24.5%", "2.22x"],
+          ["0.75", "79,336", "645", "20.8%", "1.88x"],
+        ], [1900, 2100, 1500, 1800, 1700]),
+        Callout("Why the earlier finding did not transfer", [
+          "The zero-alert result came from MARKET-level features — six series — trained across 2006 to 2020, a window containing both the global financial crisis and COVID. In that setting a couple of crises really can dominate the training distribution.",
+          "The per-stock model pools 96 symbols over 2016 to 2020: 106,157 rows, most of which are ordinary days for ordinary stocks even during a crisis. No single episode dominates, so the silence problem never arises.",
+          "Purging then only removes useful information. The relationship is monotone — it buys coverage at the cost of precision.",
+        ], "warn"),
+        P("Purging reverts to what it originally was: one of four retraining variants to be compared in Phase 7, not the baseline. The lesson generalises — a finding measured on one representation of the data does not automatically transfer to another."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 6
+      c.push(
+        H1("6. Results"),
+        ...Code([
+          "training window 2016-01-01 to 2020-12-31: 108,008 symbol-days",
+          "volatility purge: disabled (baseline)",
+          "",
+          "fitted on 106,157 complete rows",
+          "",
+          "out-of-sample (2021-01-01 onward): 128,737 symbol-days",
+          "  High          328  ( 0.25%)",
+          "  Moderate    2,432  ( 1.89%)",
+          "  Low         4,760  ( 3.70%)",
+          "",
+          "  High-band alerts: 0.6 per symbol per year",
+          "  ...of which AcceleratingDecline: 130 (40%)",
+        ]),
+        P("Roughly forty percent of High-band alerts are accompanied by an accelerating decline. The remainder are the direction-blindness in action: violent rallies and other unusual configurations that are genuinely anomalous but not bearish."),
+
+        H2("6.1 Signal strength"),
+        Tbl(["Rule", "Days", "P(crash)", "Lift"], [
+          ["base rate", "—", "11.0%", "1.00x"],
+          ["AcceleratingDecline alone, no model", "38,612", "12.0%", "1.10x"],
+          ["slope_z below -1 alone, no model", "3,451", "13.2%", "1.20x"],
+          ["intensity 0.95+ with AcceleratingDecline", "875", "20.7%", "1.88x"],
+          ["intensity 0.99+ with AcceleratingDecline", "125", "38.4%", "3.48x"],
+        ], [3800, 1500, 1800, 1900]),
+        P("The trend rules alone are worth almost nothing — 1.10 and 1.20 against a baseline of 1.00. The anomaly score carries the signal; slope and acceleration convert unusual into unusually bad. Neither half works without the other."),
+        Break(),
+      );
+
+      // ------------------------------------------------------- 7
+      c.push(
+        H1("7. Tests"),
+        P("86 passing. The ones specific to this phase:"),
+        Tbl(["Test", "Proves"], [
+          ["Intensity is a training percentile", "On its own training data, intensity is uniform on [0,1]"],
+          ["Threshold means the same under every fit", "Different settings each select ~1% at 0.99 — the property Phase 7 depends on"],
+          ["Outliers score higher", "Shifted rows score well above the bulk"],
+          ["Incomplete rows score missing", "Never imputed; the index is preserved"],
+          ["Save/load round trip", "Reloaded detector reproduces intensity exactly"],
+          ["Determinism", "Same seed gives identical scores"],
+          ["Purge selects by date", "Crises are a property of a day, not of a stock"],
+        ], [3400, 5600]),
+        RichP([
+          { text: "The purge-by-date test deserves a note. Purging individual high-volatility ROWS would silently exclude permanently volatile names such as ADANIENT from training altogether, so the model would never learn what normal looks like for them. A crisis is a property of a " },
+          { text: "day", italics: true },
+          { text: ", not of a stock, and the implementation reflects that." },
+        ]),
+
+        H1("8. Known limitations"),
+        Num("The sample is smaller than it looks. 125 signals sounds substantial, but one market event hits many correlated stocks on the same day, so the effective number of independent episodes is far lower."),
+        Num("Lift is measured against a coincident label. P(crash) here means the probability a crash follows within five days. It is genuinely forward-looking, but it is not the same as lead time, which Phase 4 measures."),
+        Num("Ranked across all days the detector reaches an area under the curve of only 0.53. Much of that is unfair to a direction-blind model being scored on a crash-only label, but it is not nothing."),
+        Num("Thresholds of 0.99, 0.95 and 0.90 are conventional round numbers. They have not been optimised, and optimising them against the hold-out would be a form of look-ahead."),
+        Num("A single training window is used. Whether the detector degrades as the market drifts away from 2016-2020 is exactly what Phase 7 exists to measure."),
+
+        H1("9. Handoff to Phase 4"),
+        P("Phase 4 inherits an intensity series for every symbol-day, a settled crash definition based on absolute magnitude, and a signal rule combining intensity with trend phase."),
+        P("Its job is the question this project actually turns on: not whether the signal fires on crash days, but how many days BEFORE the crash it fires."),
+        Callout("Why Phase 4 comes before the backtest", [
+          "Everything measured so far says the signal fires when crashes are near. None of it says how early.",
+          "If the answer is zero days, the strategy is a fast-reaction system rather than a predictive one — still useful, but a different claim, a different paper, and a different set of expectations.",
+          "Learning that from a lead-time histogram now costs an afternoon. Learning it from an equity curve in Phase 8 would cost weeks of work built on a premise that does not hold.",
+        ], "warn"),
+      );
+
+      return c;
+    },
+  },
 };
 
 // =====================================================================
