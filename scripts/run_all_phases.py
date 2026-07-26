@@ -33,6 +33,7 @@ from qbeast_crash.config import (
     DATA_INTERIM,
     DATA_PROCESSED,
     DEFAULT_CONFIG,
+    MODELS,
     REPORTS,
     ensure_dirs,
 )
@@ -43,6 +44,7 @@ from qbeast_crash.data import (
     run_quality_gate,
     trading_calendar,
 )
+from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
 from qbeast_crash.features import (
     FEATURE_COLUMNS,
     MARKET_FEATURE_COLUMNS,
@@ -139,10 +141,71 @@ def phase_2(ctx: dict) -> dict:
     return {"features": long, "market": market}
 
 
+# =====================================================================
+# Phase 3 -- Isolation Forest + intensity
+# =====================================================================
+def phase_3(ctx: dict) -> dict:
+    """Fit the detector on the training window and score the full history."""
+    _rule("PHASE 3  Isolation Forest + intensity")
+
+    features, market = ctx["features"], ctx["market"]
+    w = CFG.windows
+    dates = features.index.get_level_values("date")
+    train = features[(dates >= pd.Timestamp(w.train_start)) & (dates <= pd.Timestamp(w.train_end))]
+
+    purge = (
+        purge_crisis_dates(train, market, quantile=CFG.model.purge_quantile)
+        if CFG.model.purge_quantile is not None else None
+    )
+    print(f"training window {w.train_start} to {w.train_end}: {len(train):,} symbol-days")
+    print("volatility purge: disabled (baseline)" if purge is None
+          else f"volatility purge at q={CFG.model.purge_quantile}: withholding {len(purge)} dates")
+    print()
+
+    detector = AnomalyDetector(
+        n_estimators=CFG.model.n_estimators,
+        max_samples=CFG.model.max_samples,
+        random_state=CFG.model.random_state,
+    ).fit(train, exclude_dates=purge)
+    print(f"fitted on {detector.n_train_:,} complete rows "
+          f"({detector.train_dates_[0].date()} to {detector.train_dates_[1].date()})")
+
+    intensity = detector.intensity(features)
+    scored = features.assign(
+        intensity=intensity,
+        band=detector.band(intensity),
+    )
+
+    detector.save(MODELS / "detector_baseline.pkl")
+    scored[["intensity", "band", "slope_z", "accel_z", "phase"]].to_parquet(
+        DATA_PROCESSED / "intensity.parquet"
+    )
+
+    oos = scored[scored.index.get_level_values("date") >= pd.Timestamp(w.backtest_start)]
+    print(f"\nout-of-sample ({w.backtest_start} onward): {len(oos):,} symbol-days")
+    counts = oos["band"].value_counts()
+    for lab in ("High", "Moderate", "Low"):
+        n = int(counts.get(lab, 0))
+        print(f"  {lab:9s} {n:7,d}  ({n / len(oos) * 100:5.2f}%)")
+
+    n_sym = oos.index.get_level_values("symbol").nunique()
+    n_yrs = (oos.index.get_level_values("date").max()
+             - oos.index.get_level_values("date").min()).days / 365.25
+    high = int(counts.get("High", 0))
+    print(f"\n  High-band alerts: {high / n_sym / n_yrs:.1f} per symbol per year")
+
+    directional = oos[(oos["band"] == "High") & (oos["phase"] == "AcceleratingDecline")]
+    print(f"  ...of which AcceleratingDecline: {len(directional):,} "
+          f"({len(directional) / max(high, 1) * 100:.0f}%)")
+
+    print(f"\nwrote intensity.parquet {scored.shape} and detector_baseline.pkl")
+    return {"detector": detector, "scored": scored}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
-    # 3: ("Isolation Forest + intensity", phase_3),
+    3: ("Isolation Forest + intensity", phase_3),
     # 4: ("Labels + lead time", phase_4),
 }
 

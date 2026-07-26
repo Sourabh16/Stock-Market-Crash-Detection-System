@@ -21,6 +21,7 @@ DATA_RAW = PROJECT_ROOT / "data" / "raw"
 DATA_INTERIM = PROJECT_ROOT / "data" / "interim"
 DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
 REPORTS = PROJECT_ROOT / "reports"
+MODELS = PROJECT_ROOT / "models"
 
 #: The index file doubles as our master trading calendar. It is the only
 #: series guaranteed to have a bar on every day the exchange was open.
@@ -114,10 +115,61 @@ class FeatureConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    """Isolation Forest settings.
+
+    Note what is absent: `contamination`. Measured across values from 0.001 to
+    0.2, the raw anomaly scores are bit-identical -- it does not affect tree
+    building, only an internal offset used to binarise scores in predict(),
+    which this pipeline never calls. See model.py.
+    """
+
+    n_estimators: int = 300
+
+    #: The subsample each tree isolates from. Measured across a 64x range on
+    #: this data it barely matters -- lift moved only 2.18x to 2.29x from 64 to
+    #: 4096 -- so 256 (the sklearn default) is kept. Recorded because an earlier
+    #: note in this file claimed it was the parameter that mattered most; on
+    #: this dataset that is not borne out.
+    max_samples: int = 256
+
+    random_state: int = 0
+
+    #: Withhold the top-quantile of market turbulence from training.
+    #: None disables purging, which is the BASELINE.
+    #:
+    #: The idea is sound in the situation that motivated it: Isolation Forest
+    #: learns normal from what it is shown, so training on crises makes crises
+    #: unremarkable. A detector trained on MARKET-level features across all
+    #: history through 2020 -- containing both 2008 and COVID -- fired ZERO
+    #: alerts across 1,344 out-of-sample days.
+    #:
+    #: But on the POOLED PER-STOCK cross-section it is counterproductive.
+    #: Measured on 2021-2026, signal = intensity 0.99+ and AcceleratingDecline,
+    #: against a base crash rate of 11.0%:
+    #:
+    #:     purge   signals   P(crash)   lift
+    #:     none        125      38.4%   3.48x
+    #:     0.99        205      29.3%   2.65x
+    #:     0.95        420      24.8%   2.24x
+    #:     0.90        444      24.5%   2.22x
+    #:     0.75        645      20.8%   1.88x
+    #:
+    #: Monotone: purging buys coverage at the cost of precision. Pooling 96
+    #: symbols over 2016-2020 gives a training distribution rich enough that no
+    #: single crisis dominates it, so the silence problem never arises and the
+    #: cure is worse than the disease.
+    #:
+    #: Purging therefore remains a Phase 7 retraining VARIANT, not the default.
+    purge_quantile: float | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     windows: WindowConfig = field(default_factory=WindowConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
 
 
 DEFAULT_CONFIG = Config()
@@ -125,5 +177,5 @@ DEFAULT_CONFIG = Config()
 
 def ensure_dirs() -> None:
     """Create output directories. Raw data is read-only and never created."""
-    for path in (DATA_INTERIM, DATA_PROCESSED, REPORTS, REPORTS / "figures"):
+    for path in (DATA_INTERIM, DATA_PROCESSED, REPORTS, REPORTS / "figures", MODELS):
         path.mkdir(parents=True, exist_ok=True)

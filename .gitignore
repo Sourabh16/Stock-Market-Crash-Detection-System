@@ -40,3 +40,6 @@ package-lock.json
 
 # Microsoft Office lock files (created while a doc is open)
 ~$*
+
+# Fitted models (regenerable — run scripts/run_all_phases.py)
+/models/
