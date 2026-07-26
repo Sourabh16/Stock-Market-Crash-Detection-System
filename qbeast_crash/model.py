@@ -168,6 +168,7 @@ class AnomalyDetector:
 
     forest: IsolationForest | None = field(default=None, repr=False)
     train_scores_: np.ndarray | None = field(default=None, repr=False)
+    symbol_scores_: dict[str, np.ndarray] = field(default_factory=dict, repr=False)
     n_train_: int = 0
     train_dates_: tuple[pd.Timestamp, pd.Timestamp] | None = None
 
@@ -207,6 +208,13 @@ class AnomalyDetector:
         self.n_train_ = len(X)
         dates = X.index.get_level_values("date")
         self.train_dates_ = (dates.min(), dates.max())
+
+        # Per-symbol training distributions, for intensity_per_symbol().
+        raw = -self.forest.score_samples(X)
+        by_symbol = pd.Series(raw, index=X.index).groupby(level="symbol")
+        self.symbol_scores_ = {
+            sym: np.sort(vals.to_numpy()) for sym, vals in by_symbol
+        }
         return self
 
     # -----------------------------------------------------------------
@@ -242,6 +250,68 @@ class AnomalyDetector:
                 np.searchsorted(self.train_scores_, scores[ok].to_numpy(), side="right")
                 / len(self.train_scores_)
             )
+        return out
+
+    def intensity_per_symbol(self, features: pd.DataFrame) -> pd.Series:
+        """
+        Intensity ranked against each symbol's OWN training scores.
+
+        WHY THIS EXISTS
+        ---------------
+        The pooled intensity has a flaw that only shows up when you look at
+        coverage. It ranks every day against ONE distribution built from all
+        symbols together -- and that distribution is dominated by the most
+        volatile names. A calm stock can therefore never reach the top of it,
+        no matter what it does.
+
+        Measured over 2021-2026, the highest intensity each stock EVER reached:
+
+            ADANIENT     1.0000
+            HDFCBANK     0.9950
+            RELIANCE     0.9897     <- never reaches a 0.99 threshold
+            MARUTI       0.9902
+            TATASTEEL    0.9894     <- never
+            SUNPHARMA    0.9888     <- never
+            LT           0.9876     <- never
+
+        Seven of ten symbols could not fire at 0.99 even in principle. The
+        model was not declining to act on them; it was structurally unable to.
+
+        This is the same mistake already fixed for slope, where dividing by
+        each stock's OWN volatility is what makes -1% per day mean the same
+        thing for HINDUNILVR and ADANIENT. Intensity needs the same treatment:
+        "unusual FOR THIS STOCK" is the question a per-stock exit rule asks.
+
+        THE TRADE-OFF, STATED PLAINLY
+        -----------------------------
+        Per-symbol intensity gives every stock the same alert budget, so
+        coverage becomes uniform. What it gives up is cross-sectional
+        comparison: a 0.99 for a placid stock is no longer the same event as a
+        0.99 for a wild one, so this must NOT be used to rank which stocks to
+        act on first. Use pooled intensity for ranking, per-symbol for
+        triggering.
+        """
+        self._check_fitted()
+        scores = self.raw_score(features)
+        out = pd.Series(np.nan, index=features.index, dtype=float)
+
+        symbols = features.index.get_level_values("symbol")
+        for sym, dist in self.symbol_scores_.items():
+            if len(dist) < 100:
+                # Too little history to define a percentile for this symbol;
+                # falling back to the pooled scale is better than inventing one.
+                continue
+            mask = (symbols == sym) & scores.notna().to_numpy()
+            if not mask.any():
+                continue
+            out.loc[mask] = (
+                np.searchsorted(dist, scores[mask].to_numpy(), side="right") / len(dist)
+            )
+
+        # Symbols absent from training keep the pooled scale.
+        missing = out.isna() & scores.notna()
+        if missing.any():
+            out.loc[missing] = self.intensity(features[missing])
         return out
 
     def band(self, intensity: pd.Series, bands: IntensityBands | None = None) -> pd.Series:

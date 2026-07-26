@@ -142,3 +142,37 @@ def test_scatter_splits_three_ways_not_two(tmp_path):
         "strategy_max_drawdown": [-0.30, -0.35, -0.28, -0.50],
     }, index=["FLAT1", "BETTER", "WORSE", "FLAT2"])
     assert plot_drawdown_scatter(table, tmp_path).exists()
+
+
+def test_scheme_comparison_chart_is_written(tmp_path, symbol_inputs):
+    """One stock, several retraining schemes overlaid."""
+    from qbeast_crash.plots import plot_portfolio_schemes, plot_scheme_comparison
+    close, sig = symbol_inputs
+    other = sig.copy()
+    other.iloc[250:260, other.columns.get_loc("in_position")] = False
+    other.iloc[250, other.columns.get_loc("action")] = "EXIT"
+
+    path = plot_scheme_comparison("TEST", close, {"rolling": sig, "ewma": other}, tmp_path)
+    assert path is not None and path.exists() and path.stat().st_size > 5_000
+
+
+def test_portfolio_schemes_chart_is_written(tmp_path):
+    from qbeast_crash.plots import plot_portfolio_schemes
+    idx = pd.bdate_range("2021-01-04", periods=300)
+    rng = np.random.default_rng(3)
+    bench = pd.Series(np.exp(np.cumsum(rng.normal(0.0004, 0.012, 300))), index=idx)
+    curves = {
+        s: pd.Series(np.exp(np.cumsum(rng.normal(0.0005, 0.011, 300))), index=idx)
+        for s in ("rolling", "incremental", "ewma")
+    }
+    assert plot_portfolio_schemes(curves, bench, tmp_path).exists()
+
+
+def test_scheme_comparison_survives_a_scheme_with_no_exits(tmp_path, symbol_inputs):
+    """Most symbols are never traded, so this is the common case, not an edge."""
+    from qbeast_crash.plots import plot_scheme_comparison
+    close, sig = symbol_inputs
+    quiet = sig.copy()
+    quiet["in_position"] = True
+    quiet["action"] = ""
+    assert plot_scheme_comparison("TEST", close, {"rolling": quiet}, tmp_path).exists()

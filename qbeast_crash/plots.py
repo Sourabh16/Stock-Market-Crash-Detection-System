@@ -37,7 +37,8 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 __all__ = ["DrawdownStats", "drawdown_series", "drawdown_stats",
-           "plot_symbol", "plot_portfolio", "plot_drawdown_scatter"]
+           "plot_symbol", "plot_portfolio", "plot_drawdown_scatter",
+           "plot_scheme_comparison", "plot_portfolio_schemes", "SCHEME_COLOURS"]
 
 #: One palette, used everywhere, so a colour means the same thing on every
 #: chart: the strategy is always blue, buy-and-hold always grey, exits red.
@@ -329,6 +330,140 @@ def plot_drawdown_scatter(table: pd.DataFrame, out_dir: Path) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "drawdown_scatter.png"
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+#: One colour per retraining scheme, consistent across every chart.
+SCHEME_COLOURS = {
+    "rolling": "#1F4E79",
+    "incremental": "#C77800",
+    "ewma": "#1E7B34",
+    "vol_purged": "#8E44AD",
+}
+
+
+def plot_scheme_comparison(
+    symbol: str,
+    close: pd.Series,
+    signals_by_scheme: dict[str, pd.DataFrame],
+    out_dir: Path,
+) -> Path | None:
+    """
+    One stock, all retraining schemes overlaid.
+
+    Top panel: price, with each scheme's exits marked at its own height so
+    overlapping signals stay readable.
+    Bottom panel: drawdown per scheme against buy-and-hold.
+
+    The bottom panel is the one that answers the question. Returns are noisy
+    and a scheme can win on return by luck; drawdown depth is what the strategy
+    exists to reduce, so that is where a real difference would show.
+    """
+    close = close.dropna()
+    if close.empty:
+        return None
+
+    ret = close.pct_change().fillna(0.0)
+    bench = (1 + ret).cumprod()
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
+                             gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.12})
+
+    ax = axes[0]
+    ax.plot(close.index, close.to_numpy(), color="#333333", linewidth=1.0, zorder=2)
+    ax.set_ylabel("price")
+
+    lo, hi = close.min(), close.max()
+    span = hi - lo
+    summary = []
+
+    ax2 = axes[1]
+    dd_b = drawdown_series(bench)
+    ax2.fill_between(dd_b.index, dd_b.to_numpy(), 0, color=BENCHMARK, alpha=0.40,
+                     label=f"buy & hold  {dd_b.min():.1%}")
+
+    for i, (scheme, sig) in enumerate(signals_by_scheme.items()):
+        colour = SCHEME_COLOURS.get(scheme, STRATEGY)
+        sig = sig.reindex(close.index)
+        held = sig["in_position"].fillna(True).astype(bool)
+        strat = (1 + ret * held.astype(float)).cumprod()
+
+        exits = sig.index[sig["action"] == "EXIT"]
+        if len(exits):
+            # Stagger marker heights so overlapping exits stay distinguishable.
+            y = lo + span * (0.04 + 0.05 * i)
+            ax.scatter(exits, np.full(len(exits), y), marker="v", s=55,
+                       color=colour, zorder=5)
+
+        dd = drawdown_series(strat)
+        ax2.plot(dd.index, dd.to_numpy(), color=colour, linewidth=1.2,
+                 label=f"{scheme}  {dd.min():.1%}  ({len(exits)} exits)")
+        summary.append(f"{scheme} {(strat.iloc[-1]-1)*100:+.0f}%")
+
+    ax.set_title(
+        f"{symbol}   buy & hold {(bench.iloc[-1]-1)*100:+.0f}%   |   " + "   ".join(summary),
+        loc="left", fontsize=11, fontweight="bold",
+    )
+    for scheme in signals_by_scheme:
+        ax.scatter([], [], marker="v", s=55,
+                   color=SCHEME_COLOURS.get(scheme, STRATEGY), label=f"{scheme} exit")
+    ax.legend(loc="upper left", frameon=False, fontsize=9, ncol=len(signals_by_scheme))
+    _style(ax)
+
+    ax2.set_ylabel("drawdown")
+    ax2.legend(loc="lower left", frameon=False, fontsize=9)
+    _pct(ax2)
+    _style(ax2)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{symbol}.png"
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_portfolio_schemes(
+    equity_by_scheme: dict[str, pd.Series],
+    benchmark: pd.Series,
+    out_dir: Path,
+    name: str = "portfolio_schemes",
+) -> Path:
+    """Portfolio equity and drawdown for every retraining scheme at once."""
+    fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True,
+                             gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.12})
+
+    ax = axes[0]
+    ax.plot(benchmark.index, (benchmark / benchmark.iloc[0]).to_numpy(),
+            color=BENCHMARK, linewidth=1.6, label=f"buy & hold  {(benchmark.iloc[-1]/benchmark.iloc[0]-1)*100:+.0f}%")
+    for scheme, eq in equity_by_scheme.items():
+        ax.plot(eq.index, (eq / eq.iloc[0]).to_numpy(),
+                color=SCHEME_COLOURS.get(scheme, STRATEGY), linewidth=1.4,
+                label=f"{scheme}  {(eq.iloc[-1]/eq.iloc[0]-1)*100:+.0f}%")
+    ax.set_ylabel("growth of 1")
+    ax.legend(loc="upper left", frameon=False, fontsize=9)
+    ax.set_title("Portfolio by retraining scheme, 2021-2026", loc="left",
+                 fontsize=12, fontweight="bold")
+    _style(ax)
+
+    ax = axes[1]
+    dd_b = drawdown_series(benchmark)
+    ax.fill_between(dd_b.index, dd_b.to_numpy(), 0, color=BENCHMARK, alpha=0.40,
+                    label=f"buy & hold  {dd_b.min():.1%}")
+    for scheme, eq in equity_by_scheme.items():
+        dd = drawdown_series(eq)
+        ax.plot(dd.index, dd.to_numpy(), color=SCHEME_COLOURS.get(scheme, STRATEGY),
+                linewidth=1.3, label=f"{scheme}  {dd.min():.1%}")
+    ax.set_ylabel("drawdown")
+    ax.legend(loc="lower left", frameon=False, fontsize=9)
+    _pct(ax)
+    _style(ax)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{name}.png"
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return path

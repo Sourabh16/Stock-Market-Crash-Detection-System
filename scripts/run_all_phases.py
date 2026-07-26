@@ -52,6 +52,8 @@ from qbeast_crash.plots import (
     drawdown_stats,
     plot_drawdown_scatter,
     plot_portfolio,
+    plot_portfolio_schemes,
+    plot_scheme_comparison,
     plot_symbol,
 )
 from qbeast_crash.retrain import SCHEMES, SchemeResult, walk_forward
@@ -681,13 +683,14 @@ def phase_7(ctx: dict) -> dict:
     bh = performance(bh_equity, years)
 
     results, intensities = [], {}
+    scheme_signals, scheme_equity = {}, {}
     for scheme in SCHEMES:
         t0 = time.time()
         intensity = walk_forward(features, calendar, scheme, CFG, market, verbose=True)
         intensities[scheme] = intensity
 
         scored = features.assign(intensity=intensity)
-        pos, n_exits = {}, 0
+        pos, n_exits, sig_by_symbol = {}, 0, {}
         for sym in frames:
             try:
                 sub = scored.xs(sym, level="symbol")
@@ -698,11 +701,15 @@ def phase_7(ctx: dict) -> dict:
                 continue
             sig = generate_signals(sub, CFG.signals, reentry=ctx.get("reentry_rule", "time"))
             pos[sym] = sig["in_position"].reindex(oos, fill_value=True)
+            sig_by_symbol[sym] = sig
             n_exits += int((sig["action"] == "EXIT").sum())
 
         pos_panel = pd.DataFrame(pos).reindex(columns=ret_panel.columns, fill_value=True)
         cols = ret_panel.columns.intersection(pos_panel.columns)
-        strat = performance(equal_weight_equity(ret_panel[cols], pos_panel[cols]), years)
+        eq = equal_weight_equity(ret_panel[cols], pos_panel[cols])
+        strat = performance(eq, years)
+        scheme_equity[scheme] = eq
+        scheme_signals[scheme] = sig_by_symbol
 
         results.append(SchemeResult(
             scheme=scheme,
@@ -748,8 +755,64 @@ def phase_7(ctx: dict) -> dict:
     table.to_csv(REPORTS / "phase7_scheme_comparison.csv")
     pd.DataFrame(intensities).to_parquet(DATA_PROCESSED / "intensity_by_scheme.parquet")
 
+    # ---- coverage: how many stocks does each scheme actually act on? ----
+    # This matters more than it looks. A static fit on 2016-2020 reaches only
+    # 3 of 10 dev symbols, because that window contains COVID and sets a bar
+    # calm stocks can never clear. Walk-forward windows drop COVID as they
+    # roll, so coverage roughly triples.
+    print(f"\nCOVERAGE -- symbols the scheme actually traded")
+    print(f"{'scheme':14s}{'traded':>10s}{'of':>4s}{'exits':>9s}{'per sym/yr':>13s}")
+    for scheme, sigs in scheme_signals.items():
+        traded = sum(1 for s_ in sigs.values() if (s_["action"] == "EXIT").any())
+        tot = sum(int((s_["action"] == "EXIT").sum()) for s_ in sigs.values())
+        print(f"{scheme:14s}{traded:10d}{len(frames):4d}{tot:9d}"
+              f"{tot / max(len(frames), 1) / years:13.2f}")
+
+    # ---- charts ---------------------------------------------------------
+    figures = REPORTS / "figures"
+    main = [s_ for s_ in ("rolling", "incremental", "ewma") if s_ in scheme_equity]
+    plot_portfolio_schemes({k: scheme_equity[k] for k in main},
+                           equal_weight_equity(ret_panel), figures)
+
+    drawn = 0
+    for sym, frame in frames.items():
+        close = frame["close"].astype(float).reindex(oos).dropna()
+        if len(close) < 250:
+            continue
+        per_scheme = {k: scheme_signals[k][sym] for k in main if sym in scheme_signals[k]}
+        if not per_scheme:
+            continue
+        if plot_scheme_comparison(sym, close, per_scheme, figures / "schemes") is not None:
+            drawn += 1
+
+    # ---- per-stock drawdown, per scheme ---------------------------------
+    rows = []
+    for sym, frame in frames.items():
+        close = frame["close"].astype(float).reindex(oos).dropna()
+        if len(close) < 250:
+            continue
+        r_ = close.pct_change().fillna(0.0)
+        row = {"symbol": sym,
+               "bh_max_dd": drawdown_stats((1 + r_).cumprod()).max_drawdown}
+        for k in main:
+            sig = scheme_signals[k].get(sym)
+            if sig is None:
+                continue
+            held = sig["in_position"].reindex(close.index).fillna(True).astype(bool)
+            eq = (1 + r_ * held.astype(float)).cumprod()
+            row[f"{k}_max_dd"] = drawdown_stats(eq).max_drawdown
+            row[f"{k}_return"] = eq.iloc[-1] - 1
+            row[f"{k}_exits"] = int((sig["action"] == "EXIT").sum())
+        rows.append(row)
+    per_stock = pd.DataFrame(rows).set_index("symbol")
+    per_stock.to_csv(REPORTS / "phase7_drawdown_by_symbol_by_scheme.csv")
+
     print(f"\nwrote {REPORTS / 'phase7_scheme_comparison.csv'}")
-    return {"schemes": table, "scheme_intensity": intensities}
+    print(f"      {REPORTS / 'phase7_drawdown_by_symbol_by_scheme.csv'}")
+    print(f"      {figures / 'portfolio_schemes.png'}")
+    print(f"      {figures / 'schemes'}/  ({drawn} per-stock charts)")
+    return {"schemes": table, "scheme_intensity": intensities,
+            "scheme_signals": scheme_signals, "per_stock_schemes": per_stock}
 
 
 # =====================================================================
