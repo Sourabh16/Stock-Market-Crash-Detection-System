@@ -37,3 +37,6 @@ package-lock.json
 .idea/
 .vscode/
 .DS_Store
+
+# Microsoft Office lock files (created while a doc is open)
+~$*
