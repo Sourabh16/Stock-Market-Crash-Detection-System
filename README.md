@@ -7,10 +7,10 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white">
-  <img alt="tests" src="https://img.shields.io/badge/tests-48%20passing-1E7B34">
+  <img alt="tests" src="https://img.shields.io/badge/tests-71%20passing-1E7B34">
   <img alt="universe" src="https://img.shields.io/badge/universe-96%20symbols-1F4E79">
   <img alt="bars" src="https://img.shields.io/badge/trading%20days-5820-1F4E79">
-  <img alt="status" src="https://img.shields.io/badge/status-phase%202%20of%2010-orange">
+  <img alt="status" src="https://img.shields.io/badge/status-phase%202%20of%2010%20done-orange">
 </p>
 
 ---
@@ -103,8 +103,9 @@ precisely the labels that drive entries and exits.
 
 ## Data integrity
 
-Before any model code was written, the 100 raw CSVs were audited. Five defects were found,
-each of which would have silently corrupted results:
+Before any model code was written, the 100 raw CSVs were audited. Six defects were found,
+each of which would have silently corrupted results — and none of which would have raised
+an error, a warning, or a crash:
 
 | # | Defect | Evidence | Handling |
 |:--|:--|:--|:--|
@@ -113,6 +114,7 @@ each of which would have silently corrupted results:
 | 3 | Zero-range bars | BAJFINANCE: 1,092 of 5,803 bars have `O=H=L=C` | Flagged, never dropped |
 | 4 | Ragged end dates | Files end 2026-06-03 → 2026-06-22 | Trimmed to common 2026-06-05 |
 | 5 | Survivorship bias | Universe is *today's* NIFTY 100 | Documented as a limitation |
+| 6 | Unadjusted corporate actions | CGPOWER 155.30 → 53.05 on 2016-03-15 (demerger) | Truncated; real crashes preserved |
 
 **The gap rule recovers real NSE listing dates exactly.** Any calendar gap over 10 days is a
 vendor artefact — the NSE has never closed that long — so the first genuine bar is the one
@@ -127,6 +129,17 @@ after the last such gap:
 
 Validated against dates sourced *independently of this codebase*, not against its own
 output — which is what makes it a real check rather than a tautology.
+
+**Defect 6 is the instructive one.** A demerger bar is internally consistent — high above
+close, close above low, price positive, no gap — so it passes every *structural* check. Only
+the **return** betrays it. And it matters disproportionately because Isolation Forest is
+unsupervised: a −66% day inside the training window becomes the most extreme point in the
+sample and drags the anomaly boundary toward it, making genuine crashes look ordinary. One
+bad bar degrades every score that follows.
+
+The hard part was not filtering it out but **not filtering too much** — ADANIENT's −26.1%
+Hindenburg crash and TRENT's −31.9% must survive, since those are the very events the
+project exists to detect.
 
 **Gaps are never forward-filled.** A carried-forward price manufactures a return of exactly
 zero, and a run of zeros reads to the model as a stretch of unnatural calm, biasing every
@@ -177,9 +190,14 @@ Expected columns: `date` (`DD-MM-YYYY`), `open`, `high`, `low`, `close`, `volume
 Optional metadata (`_source`, `_dq_score`, `_gap_filled`) is preserved if present.
 
 ```bash
-python scripts/run_phase1.py     # load, repair, validate, persist
-python -m pytest tests/ -q       # 48 tests
+python scripts/run_all_phases.py            # every phase, in order
+python scripts/run_all_phases.py --phase 2  # one phase
+python scripts/run_all_phases.py --list     # what exists
+python -m pytest tests/ -q                  # 71 tests
 ```
+
+The pipeline is deterministic. Deleting `data/interim/`, `data/processed/` and
+`reports/` and re-running reproduces every artifact — a full rebuild takes ~5s.
 
 Expected output:
 
@@ -201,24 +219,20 @@ loading universe ...
 
 ```
 qbeast_crash/
-├── config.py              single source of truth — paths, windows, thresholds
-├── data/
-│   ├── loader.py          raw CSV → clean frame; one tested rule per defect
-│   ├── calendar.py        master calendar + listing mask
-│   └── quality.py         the audit, enforced as a blocking gate
-├── features/
-│   └── slope_accel.py     causal slope, acceleration, trend phase
-└── signals/
-    └── regime.py          regime detection; HMM drops in behind RegimeDetector
+├── config.py         single source of truth — paths, windows, thresholds
+├── data.py           Phase 1: load, clean, calendar, quality gate
+├── features.py       Phase 2: slope/accel, precursors, cross-sectional
+└── regime.py         regime detection; HMM drops in behind RegimeDetector
 
 scripts/
-├── run_phase1.py          data pipeline entry point
-└── build_docx.js          regenerates the documentation
-tests/                     48 tests, causality enforced
-docs/                      implementation plan + full project documentation
+├── run_all_phases.py single entry point for the whole pipeline
+└── build_docs.js     regenerates the per-phase documentation
+
+tests/                71 tests, causality enforced
+docs/phases/          one document per phase
 ```
 
-Both regressions in `slope_accel.py` collapse to **fixed weight vectors** over an evenly
+Both regressions in the slope/acceleration layer collapse to **fixed weight vectors** over an evenly
 spaced window, so each feature is a single weighted sum. That is not just fast — it makes
 causality *structural*. There is no code path that could look forward, so it cannot be
 broken by a later edit.
@@ -231,8 +245,8 @@ broken by a later edit.
 |:--|:--|:--|
 | 0 | Data audit — five defects identified | ✅ done |
 | 1 | Data layer — loader, calendar, quality gate | ✅ done |
-| 2 | Features — slope/accel done; precursors + cross-sectional pending | 🔶 part |
-| 3 | Isolation Forest + anomaly intensity | ⬜ |
+| 2 | Features — precursors, cross-sectional, slope/accel | ✅ done |
+| 3 | Isolation Forest + anomaly intensity | ⬜ next |
 | 4 | Crash labels + lead-time measurement | ⬜ **go/no-go gate** |
 | 5 | Signals — per-stock and market-wide | ⬜ |
 | 6 | Backtest engine + Indian cost/tax model | ⬜ |
@@ -286,12 +300,12 @@ GST on the appropriate base. Three refinements are planned:
 
 ## Notes for contributors
 
-- **Regime detection** — `signals/regime.py` defines a `RegimeDetector` interface. An HMM
+- **Regime detection** — `regime.py` defines a `RegimeDetector` interface. An HMM
   replacement must be causal: refit as you go, or at minimum use *filtered* state
   probabilities `P(state_t | data ≤ t)` rather than *smoothed* ones `P(state_t | all data)`.
   Fitting an HMM on the full sample and then decoding is the same look-ahead bug in a
   smarter costume. Point `tests/test_regime.py` at it before wiring it in.
-- **Data quality** — `data/quality.py` blocks the pipeline on ERROR-level failures. If it
+- **Data quality** — the quality gate in `data.py` blocks the pipeline on ERROR-level failures. If it
   fires, fix the data rather than loosening the check.
-- **Documentation** — `docs/*.docx` is generated. Edit `scripts/build_docx.js` and re-run
-  `node scripts/build_docx.js`; never hand-edit the docx, or it will drift from the code.
+- **Documentation** — `docs/phases/*.docx` is generated. Edit `scripts/build_docs.js` and
+  re-run `node scripts/build_docs.js`; never hand-edit a docx, or it will drift from the code.

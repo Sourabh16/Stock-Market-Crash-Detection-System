@@ -15,8 +15,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qbeast_crash.data.loader import load_symbol
-from qbeast_crash.signals.regime import (
+from qbeast_crash.data import load_symbol
+from qbeast_crash.regime import (
     MARKET_REGIMES,
     VOL_REGIMES,
     detect_regimes,
