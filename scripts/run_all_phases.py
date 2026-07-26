@@ -47,6 +47,13 @@ from qbeast_crash.data import (
 )
 from qbeast_crash.labels import LEAD_BUCKETS, CrashDefinition, label_events, lead_time_report
 from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
+from qbeast_crash.signals import (
+    ReentryRule,
+    SignalConfig,
+    generate_signals,
+    market_signal,
+    signal_strength,
+)
 from qbeast_crash.features import (
     FEATURE_COLUMNS,
     MARKET_FEATURE_COLUMNS,
@@ -319,11 +326,159 @@ def phase_4(ctx: dict) -> dict:
     return {"lead_time": table, "events": events}
 
 
+# =====================================================================
+# Phase 5 -- signal generation
+# =====================================================================
+def phase_5(ctx: dict) -> dict:
+    """
+    Turn intensity into a hold/cash position, and pick the re-entry rule by
+    measurement rather than by opinion.
+
+    Exiting is the easy half -- the exit rule has a 110x edge at one day. The
+    hard half is coming back: a strategy that exits well but re-enters late
+    loses more to the missed rebound than it saved on the decline.
+    """
+    _rule("PHASE 5  Signal generation")
+
+    scored, frames, calendar = ctx["scored"], ctx["frames"], ctx["calendar"]
+    w = CFG.windows
+    cfg = SignalConfig()
+    oos = calendar[(calendar >= pd.Timestamp(w.backtest_start))
+                   & (calendar <= pd.Timestamp(w.backtest_end))]
+    years = (oos[-1] - oos[0]).days / 365.25
+
+    print(f"exit rule: intensity >= {cfg.exit_intensity} AND AcceleratingDecline")
+    print(f"guards: min_hold {cfg.min_hold}, cooldown {cfg.cooldown}, "
+          f"max_cash {cfg.max_cash_days} sessions\n")
+
+    # ---- compare re-entry rules -------------------------------------
+    # Gross of costs. Costs come in Phase 6, but a rule that cannot beat
+    # buy-and-hold before costs will not beat it after them.
+    print("RE-ENTRY RULE COMPARISON (gross of costs)")
+    print(f"{'rule':16s}{'trades/sym/yr':>15s}{'days in cash':>14s}"
+          f"{'strat CAGR':>12s}{'B&H CAGR':>10s}{'maxDD':>9s}{'B&H maxDD':>11s}")
+
+    results = {}
+    for rule in ReentryRule.ALL:
+        eq_s, eq_b, n_trades, cash_share = [], [], 0, []
+        for sym, frame in frames.items():
+            sub = scored.xs(sym, level="symbol")
+            sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
+            if len(sub) < 250:
+                continue
+            sig = generate_signals(sub, cfg, reentry=rule)
+
+            close = frame["close"].astype(float).reindex(sub.index)
+            ret = np.log(close / close.shift(1)).fillna(0.0)
+
+            strat = (ret * sig["in_position"].astype(float)).cumsum()
+            bh = ret.cumsum()
+            eq_s.append(strat.rename(sym)); eq_b.append(bh.rename(sym))
+            n_trades += int((sig["action"] == "EXIT").sum())
+            cash_share.append(1.0 - sig["in_position"].mean())
+
+        # Equal-weight the log-equity curves across symbols.
+        S = pd.concat(eq_s, axis=1).mean(axis=1)
+        B = pd.concat(eq_b, axis=1).mean(axis=1)
+
+        def stats(logeq):
+            eq = np.exp(logeq)
+            cagr = eq.iloc[-1] ** (1 / years) - 1
+            dd = (eq / eq.cummax() - 1).min()
+            return cagr, dd
+
+        cs, ds = stats(S); cb, db = stats(B)
+        tpy = n_trades / len(frames) / years
+        print(f"{rule:16s}{tpy:15.2f}{np.mean(cash_share):13.1%}"
+              f"{cs:12.2%}{cb:10.2%}{ds:9.1%}{db:11.1%}")
+        results[rule] = {"cagr": cs, "maxdd": ds, "trades_per_sym_yr": tpy,
+                         "cash_share": float(np.mean(cash_share)),
+                         "bh_cagr": cb, "bh_maxdd": db}
+
+    best = max(results, key=lambda r: results[r]["maxdd"])     # least negative
+    print(f"\nshallowest drawdown: {best}")
+    delta_pp = (results[best]["maxdd"] - results[best]["bh_maxdd"]) * 100
+    print(f"buy-and-hold maxDD {results[best]['bh_maxdd']:.1%} -> "
+          f"strategy {results[best]['maxdd']:.1%}  ({delta_pp:+.1f} pp)")
+
+    # ---- stress test: does it work when there IS a sharp crash? ------
+    # The 2021-2026 window contains no violent decline. Its worst drawdown ran
+    # 154 days at 16.5% annualised volatility with a single 3%+ day -- a slow
+    # bleed with nothing for an anomaly detector to fire on. A crash-reaction
+    # system correctly does almost nothing there, so the window cannot tell us
+    # whether the system works.
+    #
+    # 2020 can. Training on 2016-2019 keeps COVID genuinely out of sample.
+    print("\nSTRESS TEST -- 2020, model trained 2016-2019 (COVID never seen)")
+    tr_dates = ctx["features"].index.get_level_values("date")
+    stress_det = AnomalyDetector(
+        n_estimators=CFG.model.n_estimators, max_samples=CFG.model.max_samples,
+        random_state=CFG.model.random_state,
+    ).fit(ctx["features"][(tr_dates >= pd.Timestamp("2016-01-01"))
+                          & (tr_dates <= pd.Timestamp("2019-12-31"))])
+    stressed = ctx["features"].assign(intensity=stress_det.intensity(ctx["features"]))
+
+    print(f"{'window':26s}{'strat ret':>11s}{'B&H ret':>10s}"
+          f"{'strat DD':>10s}{'B&H DD':>9s}{'DD saved':>10s}{'trades':>9s}")
+    for label, a, b in [("2020 Feb-Apr (crash)", "2020-02-01", "2020-04-30"),
+                        ("2020 full year", "2020-01-01", "2020-12-31"),
+                        ("2021-2026 (no crash)", "2021-01-01", "2026-06-05")]:
+        win = calendar[(calendar >= pd.Timestamp(a)) & (calendar <= pd.Timestamp(b))]
+        yrs = max((win[-1] - win[0]).days / 365.25, 1 / 12)
+        eq_s, eq_b, n_tr = [], [], 0
+        for sym, frame in frames.items():
+            sub = stressed.xs(sym, level="symbol")
+            sub = sub[(sub.index >= win[0]) & (sub.index <= win[-1])]
+            if len(sub) < 40:
+                continue
+            sg = generate_signals(sub, cfg, reentry=best)
+            close = frame["close"].astype(float).reindex(sub.index)
+            ret = np.log(close / close.shift(1)).fillna(0.0)
+            eq_s.append((ret * sg["in_position"].astype(float)).cumsum().rename(sym))
+            eq_b.append(ret.cumsum().rename(sym))
+            n_tr += int((sg["action"] == "EXIT").sum())
+        S2 = np.exp(pd.concat(eq_s, axis=1).mean(axis=1))
+        B2 = np.exp(pd.concat(eq_b, axis=1).mean(axis=1))
+        ds = (S2 / S2.cummax() - 1).min() * 100
+        db = (B2 / B2.cummax() - 1).min() * 100
+        print(f"{label:26s}{(S2.iloc[-1] - 1) * 100:10.1f}%{(B2.iloc[-1] - 1) * 100:9.1f}%"
+              f"{ds:9.1f}%{db:8.1f}%{ds - db:+9.1f}pp{n_tr / len(frames) / yrs:9.2f}")
+
+    # ---- market-wide overlay ----------------------------------------
+    mkt = market_signal(ctx["market"]).reindex(oos).fillna(False)
+    print(f"\nmarket-wide de-risk flag: {int(mkt.sum())} sessions of {len(oos)} "
+          f"({mkt.mean():.2%}, {mkt.sum() / years:.1f}/yr)")
+    if mkt.any():
+        runs = (mkt != mkt.shift()).cumsum()[mkt]
+        print(f"  distinct episodes: {runs.nunique()}   "
+              f"dates: {', '.join(str(d.date()) for d in mkt[mkt].index[:5])}")
+
+    # ---- persist the chosen configuration ---------------------------
+    signals = {}
+    for sym, frame in frames.items():
+        sub = scored.xs(sym, level="symbol")
+        sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
+        if len(sub) < 250:
+            continue
+        sig = generate_signals(sub, cfg, reentry=best)
+        sig["strength"] = signal_strength(sub)
+        signals[sym] = sig
+
+    panel = pd.concat(signals, names=["symbol", "date"]).reorder_levels(
+        ["date", "symbol"]).sort_index()
+    panel.to_parquet(DATA_PROCESSED / "signals.parquet")
+    pd.DataFrame(results).T.to_csv(REPORTS / "phase5_reentry_comparison.csv")
+
+    print(f"\nwrote signals.parquet {panel.shape} (re-entry rule: {best})")
+    return {"signals": panel, "reentry_rule": best, "market_flag": mkt}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
     3: ("Isolation Forest + intensity", phase_3),
     4: ("Labels + lead time", phase_4),
+    5: ("Signal generation", phase_5),
 }
 
 

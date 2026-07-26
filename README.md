@@ -7,10 +7,10 @@
 
 <p align="center">
   <img alt="Python" src="https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white">
-  <img alt="tests" src="https://img.shields.io/badge/tests-103%20passing-1E7B34">
+  <img alt="tests" src="https://img.shields.io/badge/tests-120%20passing-1E7B34">
   <img alt="universe" src="https://img.shields.io/badge/universe-96%20symbols-1F4E79">
   <img alt="bars" src="https://img.shields.io/badge/trading%20days-5820-1F4E79">
-  <img alt="status" src="https://img.shields.io/badge/status-phase%204%20of%2010%20done-orange">
+  <img alt="status" src="https://img.shields.io/badge/status-phase%205%20of%2010%20done-orange">
 </p>
 
 ---
@@ -193,7 +193,7 @@ Optional metadata (`_source`, `_dq_score`, `_gap_filled`) is preserved if presen
 python scripts/run_all_phases.py            # every phase, in order
 python scripts/run_all_phases.py --phase 2  # one phase
 python scripts/run_all_phases.py --list     # what exists
-python -m pytest tests/ -q                  # 103 tests
+python -m pytest tests/ -q                  # 120 tests
 ```
 
 The pipeline is deterministic. Deleting `data/interim/`, `data/processed/` and
@@ -228,7 +228,7 @@ scripts/
 ├── run_all_phases.py single entry point for the whole pipeline
 └── build_docs.js     regenerates the per-phase documentation
 
-tests/                103 tests, causality enforced
+tests/                120 tests, causality enforced
 docs/phases/          one document per phase
 ```
 
@@ -248,7 +248,7 @@ broken by a later edit.
 | 2 | Features — precursors, cross-sectional, slope/accel | ✅ done |
 | 3 | Isolation Forest + anomaly intensity | ✅ done |
 | 4 | Crash labels + lead-time measurement | ✅ done — **see finding below** |
-| 5 | Signals — per-stock and market-wide | ⬜ |
+| 5 | Signals — per-stock and market-wide | ✅ done |
 | 6 | Backtest engine + Indian cost/tax model | ⬜ |
 | 7 | Retraining method comparison | ⬜ |
 | 8 | Drawdown analysis + per-stock charts | ⬜ |
