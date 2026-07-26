@@ -152,6 +152,20 @@ class AnomalyDetector:
     random_state: int = 0
     feature_columns: tuple[str, ...] = FEATURE_COLUMNS
 
+    #: Cap on rows used to build the training score distribution.
+    #:
+    #: The distribution only has to be accurate enough to read percentiles
+    #: from, and an empirical CDF from 50,000 draws is indistinguishable from
+    #: one built on 400,000 -- the sampling error at the 99th percentile is a
+    #: fraction of a percentile point.
+    #:
+    #: It matters because scoring is O(rows x trees). Under walk-forward the
+    #: incremental scheme's training set grows past 400,000 rows and gets
+    #: refitted 66 times, so this is the difference between a comparison that
+    #: runs in minutes and one that runs in hours. Tree building is unaffected;
+    #: Isolation Forest already subsamples max_samples per tree.
+    max_score_sample: int = 50_000
+
     forest: IsolationForest | None = field(default=None, repr=False)
     train_scores_: np.ndarray | None = field(default=None, repr=False)
     n_train_: int = 0
@@ -185,7 +199,11 @@ class AnomalyDetector:
 
         # The training score distribution IS the intensity scale. Sorted once
         # here so scoring is a binary search rather than a re-rank.
-        self.train_scores_ = np.sort(-self.forest.score_samples(X))
+        scored = X
+        if self.max_score_sample and len(X) > self.max_score_sample:
+            rng = np.random.default_rng(self.random_state)
+            scored = X.iloc[rng.choice(len(X), self.max_score_sample, replace=False)]
+        self.train_scores_ = np.sort(-self.forest.score_samples(scored))
         self.n_train_ = len(X)
         dates = X.index.get_level_values("date")
         self.train_dates_ = (dates.min(), dates.max())
@@ -222,7 +240,7 @@ class AnomalyDetector:
         if ok.any():
             out.loc[ok] = (
                 np.searchsorted(self.train_scores_, scores[ok].to_numpy(), side="right")
-                / self.n_train_
+                / len(self.train_scores_)
             )
         return out
 

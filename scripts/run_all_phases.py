@@ -48,6 +48,7 @@ from qbeast_crash.data import (
 from qbeast_crash.backtest import RateCard, TaxRates, run_backtest
 from qbeast_crash.labels import LEAD_BUCKETS, CrashDefinition, label_events, lead_time_report
 from qbeast_crash.model import AnomalyDetector, purge_crisis_dates
+from qbeast_crash.retrain import SCHEMES, SchemeResult, walk_forward
 from qbeast_crash.signals import (
     ReentryRule,
     SignalConfig,
@@ -644,6 +645,107 @@ def phase_6(ctx: dict) -> dict:
     return {"backtest": runs, "summary": summary}
 
 
+# =====================================================================
+# Phase 7 -- retraining scheme comparison
+# =====================================================================
+def phase_7(ctx: dict) -> dict:
+    """
+    Refit monthly under four rules for choosing training data, and rank them.
+
+    Phase 3 fitted once and scored five years forward, which is not how the
+    system would run live. This is walk-forward: at each refit the model sees
+    only data from before that date, and scores only until the next refit.
+    """
+    _rule("PHASE 7  Retraining scheme comparison")
+
+    features, market, frames = ctx["features"], ctx["market"], ctx["frames"]
+    calendar, w = ctx["calendar"], CFG.windows
+    oos = calendar[(calendar >= pd.Timestamp(w.backtest_start))
+                   & (calendar <= pd.Timestamp(w.backtest_end))]
+    years = w.backtest_years
+
+    print(f"walk-forward, monthly refits, {oos[0].date()} to {oos[-1].date()}")
+    print("only the training SET varies -- the schedule is identical across "
+          "schemes, so\nthe effect is attributable\n")
+
+    ret_panel = pd.DataFrame(
+        {s: f["close"].astype(float).pct_change() for s, f in frames.items()}
+    ).reindex(oos)
+    bh_equity = equal_weight_equity(ret_panel)
+    bh = performance(bh_equity, years)
+
+    results, intensities = [], {}
+    for scheme in SCHEMES:
+        t0 = time.time()
+        intensity = walk_forward(features, calendar, scheme, CFG, market, verbose=True)
+        intensities[scheme] = intensity
+
+        scored = features.assign(intensity=intensity)
+        pos, n_exits = {}, 0
+        for sym in frames:
+            try:
+                sub = scored.xs(sym, level="symbol")
+            except KeyError:
+                continue
+            sub = sub[(sub.index >= oos[0]) & (sub.index <= oos[-1])]
+            if len(sub) < 250 or sub["intensity"].notna().sum() < 100:
+                continue
+            sig = generate_signals(sub, CFG.signals, reentry=ctx.get("reentry_rule", "time"))
+            pos[sym] = sig["in_position"].reindex(oos, fill_value=True)
+            n_exits += int((sig["action"] == "EXIT").sum())
+
+        pos_panel = pd.DataFrame(pos).reindex(columns=ret_panel.columns, fill_value=True)
+        cols = ret_panel.columns.intersection(pos_panel.columns)
+        strat = performance(equal_weight_equity(ret_panel[cols], pos_panel[cols]), years)
+
+        results.append(SchemeResult(
+            scheme=scheme,
+            cagr=strat["cagr"],
+            max_drawdown=strat["max_drawdown"],
+            bh_max_drawdown=bh["max_drawdown"],
+            trades_per_symbol_year=n_exits / max(len(frames), 1) / years,
+            signals=int((scored["intensity"] >= CFG.model.intensity_high).sum()),
+        ))
+        print(f"    {'':12s} fitted in {time.time() - t0:.0f}s")
+
+    print(f"\n{'scheme':14s}{'CAGR':>9s}{'maxDD':>9s}{'vs B&H':>10s}"
+          f"{'trades/sym/yr':>15s}{'efficiency':>12s}")
+    print(f"{'buy & hold':14s}{bh['cagr']:8.2%}{bh['max_drawdown']:9.1%}"
+          f"{'--':>10s}{0.0:15.2f}{'--':>12s}")
+    for r in results:
+        print(f"{r.scheme:14s}{r.cagr:8.2%}{r.max_drawdown:9.1%}"
+              f"{r.drawdown_saved:+9.1f}pp{r.trades_per_symbol_year:15.2f}"
+              f"{r.efficiency:12.1f}")
+
+    ranked = sorted(results, key=lambda r: -r.drawdown_saved)
+    print(f"\nshallowest drawdown : {ranked[0].scheme} "
+          f"({ranked[0].drawdown_saved:+.1f}pp)")
+    by_eff = sorted([r for r in results if r.trades_per_symbol_year > 0],
+                    key=lambda r: -r.efficiency)
+    if by_eff:
+        print(f"best per unit turnover: {by_eff[0].scheme} "
+              f"({by_eff[0].efficiency:.1f}pp per trade/sym/yr)")
+
+    spread = max(r.drawdown_saved for r in results) - min(r.drawdown_saved for r in results)
+    print(f"\nspread across schemes : {spread:.1f}pp of drawdown")
+    if spread < 2.0:
+        print("  The schemes are within noise of each other. On this evidence the")
+        print("  choice of retraining rule is not a meaningful lever -- which is")
+        print("  worth knowing, and is a result rather than a failure.")
+
+    table = pd.DataFrame([{
+        "scheme": r.scheme, "cagr": r.cagr, "max_drawdown": r.max_drawdown,
+        "bh_max_drawdown": r.bh_max_drawdown, "drawdown_saved_pp": r.drawdown_saved,
+        "trades_per_sym_yr": r.trades_per_symbol_year,
+        "efficiency": r.efficiency, "high_band_days": r.signals,
+    } for r in results]).set_index("scheme")
+    table.to_csv(REPORTS / "phase7_scheme_comparison.csv")
+    pd.DataFrame(intensities).to_parquet(DATA_PROCESSED / "intensity_by_scheme.parquet")
+
+    print(f"\nwrote {REPORTS / 'phase7_scheme_comparison.csv'}")
+    return {"schemes": table, "scheme_intensity": intensities}
+
+
 PHASES = {
     1: ("Data layer", phase_1),
     2: ("Features", phase_2),
@@ -651,6 +753,7 @@ PHASES = {
     4: ("Labels + lead time", phase_4),
     5: ("Signal generation", phase_5),
     6: ("Backtest with costs", phase_6),
+    7: ("Retraining comparison", phase_7),
 }
 
 
