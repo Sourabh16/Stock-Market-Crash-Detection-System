@@ -1632,9 +1632,168 @@ const PHASES = {
         Num("The decay sweep covered 0.980 to 0.9995. Values outside that range, and the interaction between decay and refit frequency, were not explored."),
         Num("Monthly refits are assumed throughout. Refit FREQUENCY was deliberately held constant so the training set could be attributed, but frequency may matter more than the rule, and that experiment has not been run."),
 
-        H1("7. Handoff to Phase 8"),
-        P("Phase 8 produces the drawdown analysis and per-stock visualisations: strategy against buy-and-hold for each symbol, with sell signals marked and the measured lead time annotated per event."),
-        P("It inherits a settled answer on retraining -- rolling, chosen for simplicity rather than because it measurably won -- and a clear statement that the choice does not matter much. That is worth carrying into the paper explicitly: a reader who assumes the retraining scheme is where the value lies should be told, with the measurement, that it is not."),
+        H1("7. The finding that changed what this phase is for"),
+        P("The comparison above was built to answer which retraining rule performs best. The answer is that none of them does, by a margin worth caring about. But building it surfaced something more important, which only appeared when coverage was checked rather than performance."),
+        P("Under a single static fit on 2016-2020, the model traded only 44 of 96 symbols. On the ten-symbol development set it traded 3 of 10. The remaining stocks were not being judged and passed over -- they could not produce a signal at all."),
+        ...Code([
+          "highest intensity each stock EVER reached, 2021-2026, static fit",
+          "",
+          "  ADANIENT     1.0000",
+          "  HDFCBANK     0.9950",
+          "  MARUTI       0.9902",
+          "  RELIANCE     0.9897   <- a 0.99 threshold is unreachable",
+          "  TATASTEEL    0.9894   <- unreachable",
+          "  SUNPHARMA    0.9888   <- unreachable",
+          "  LT           0.9876   <- unreachable",
+        ]),
+        P("Two causes, both structural. Intensity was a percentile of the POOLED training distribution, which is dominated by the most volatile names, so a calm stock can never reach the top of it. And the 2016-2020 training window contains COVID, so each stock's own top percentile is set by March 2020, which a calm 2021-2026 never approaches."),
+        Callout("Retraining is not only an accuracy question", [
+          "It is what makes the model act at all. A rolling three-year window in 2024 contains no COVID, so the bar drops to something reachable.",
+          "",
+          "                       static fit    walk-forward",
+          "  dev universe            3 / 10        8 / 10",
+          "  full universe          44 / 96       79 / 96",
+          "",
+          "Coverage roughly doubles. That is a far larger effect than any performance difference between the schemes, and it was invisible until coverage was measured separately from performance.",
+        ], "good"),
+        P("A second fix was added alongside: intensity_per_symbol(), which ranks each day against that symbol's own training scores rather than the pooled distribution. It raises dev coverage from 3 to 6 of 10 on its own. The trade-off is explicit -- it gives up cross-sectional comparability, so a 0.99 for a placid stock is no longer the same event as a 0.99 for a wild one. Pooled intensity should rank WHICH stocks to act on; per-symbol intensity should decide WHETHER to act on one."),
+        P("The general lesson is worth more than the fix. Every metric in this phase measured how well the model performed when it acted. None of them could see that it was silently unable to act on most of the universe."),
+
+        H1("8. Charts"),
+        P("Phase 7 emits, for January 2021 to June 2026:"),
+        Bullet("portfolio_schemes.png -- portfolio equity and drawdown, all schemes overlaid"),
+        Bullet("figures/schemes/<SYMBOL>.png -- one chart per stock, 96 in total, with each scheme's buy and sell signals on its own row"),
+        Bullet("phase7_drawdown_by_symbol_by_scheme.csv -- per-stock drawdown and return under each scheme"),
+        P("Each scheme carries a distinct colour AND dash pattern AND marker. Colour alone was insufficient: the schemes agree so closely that whichever was drawn last hid the others, and the chart appeared to show a single line. That they coincide is the finding, so the chart has to be capable of showing them coinciding."),
+        Tbl(["Scheme", "Sells", "Buys", "Stocks traded"], [
+          ["rolling", "181", "180", "79 / 96"],
+          ["incremental", "146", "145", "65 / 96"],
+          ["ewma", "169", "168", "73 / 96"],
+        ], [2600, 2100, 2100, 2200]),
+
+        H1("9. Handoff to Phase 8"),
+        P("Phase 8 produces the drawdown analysis and per-stock visualisations. It inherits a settled answer on retraining -- rolling, chosen for simplicity rather than because it measurably won -- and a clear statement that the choice does not matter much."),
+        P("That is worth carrying into the paper explicitly. A reader who assumes the retraining scheme is where the value lies should be told, with the measurement, that it is not -- and that the retraining benefit which DOES exist is coverage, not accuracy."),
+      );
+
+      return c;
+    },
+  },
+
+  phase8: {
+    slug: "Phase8_Drawdown_Analysis",
+    docTitle: "QBEAST Phase 8 - Drawdown Analysis and Visualisation",
+    runningHead: "QBEAST \u00b7 Phase 8 - Drawdown",
+    build(h) {
+      const { H1, H2, H3, P, RichP, Bullet, Num, Code, Callout, Tbl, Rule, Break,
+              cover, TableOfContents } = h;
+      const c = [];
+
+      c.push(...cover({
+        phase: "PHASE 8",
+        title: "Drawdown Analysis",
+        subtitle: "Measuring the headline claim, and making it inspectable",
+        status: "STATUS: COMPLETE - 183 tests passing",
+        meta: [
+          "96 per-stock charts, a portfolio chart, and a scatter",
+          "25 symbols shallower, 6 deeper, 65 never traded",
+          "Depth improves slightly; duration does not improve at all",
+        ],
+      }));
+
+      c.push(H1("Contents"),
+        new TableOfContents("Contents", { hyperlink: true, headingStyleRange: "1-2" }),
+        Break());
+
+      c.push(
+        H1("1. What drawdown is, and what it is not"),
+        ...Code([
+          "peak_t   = highest equity seen up to day t",
+          "dd_t     = equity_t / peak_t - 1          (always <= 0)",
+          "max_dd   = the most negative dd_t",
+        ]),
+        P("Maximum drawdown is the number most strategies are judged on, and on its own it is incomplete. It says how far you fell. It says nothing about how long you stayed down, and the second is what actually decides whether a strategy is livable -- a 20% fall recovered in a month is a different experience from the same 20% taking three years."),
+        P("Three measures are therefore reported together:"),
+        Tbl(["Measure", "Question it answers"], [
+          ["Maximum drawdown", "How far below the peak did the portfolio fall?"],
+          ["Time under water", "How many sessions were spent below a prior peak?"],
+          ["Time to recover", "How long from the trough back to the old peak?"],
+        ], [2800, 6200]),
+        P("The last two are reliability metrics, which is what lets the cyber-physical framing be literal rather than decorative: depth is the magnitude of degradation, and recovery time is mean time to recovery."),
+
+        H2("1.1 A design detail that matters"),
+        P("The running peak is taken over the EQUITY CURVE, not over prices. That is what the portfolio actually experienced. Taking it over prices would measure something the investor never lived through."),
+        P("Where a position was never recovered, time-to-recover is reported as absent rather than filled with the end of the window. Never regaining the peak IS the answer, and substituting a number would quietly convert an unresolved drawdown into a resolved one."),
+        Break(),
+      );
+
+      c.push(
+        H1("2. Results across 96 symbols"),
+        Tbl(["", "Count"], [
+          ["Shallower drawdown than buy & hold", "25"],
+          ["Deeper", "6"],
+          ["Never traded at all", "65"],
+        ], [5600, 3400]),
+        Tbl(["Measure", "Value"], [
+          ["Mean drawdown saved, all symbols", "+1.00pp"],
+          ["Median drawdown saved, all symbols", "+0.00pp"],
+          ["Mean among the 44 it traded", "+2.18pp"],
+          ["Best", "ADANIPORTS +16.1pp"],
+          ["Worst", "ASIANPAINT -3.6pp"],
+        ], [5000, 4000]),
+        P("The median is zero because two-thirds of symbols are never touched. Reporting only the mean would imply a broad effect where there is a narrow one, which is why both are given and why the scatter chart exists."),
+
+        H2("2.1 Depth improves; duration does not"),
+        Tbl(["", "Median sessions under water", "Median longest spell"], [
+          ["Strategy", "1,256", "452"],
+          ["Buy & hold", "1,256", "456"],
+        ], [3000, 3200, 2800]),
+        Callout("This deserves to be stated plainly in the paper", [
+          "The strategy reduces how FAR the portfolio falls, very slightly. It does not reduce how LONG it stays down at all - the medians are identical to within four sessions.",
+          "So an investor experiences almost exactly the same length of discomfort, ending marginally less deep. That is a narrower benefit than \u201cdrawdown reduction\u201d suggests on its own, and stating it is more persuasive than omitting it.",
+        ], "warn"),
+
+        H2("2.2 Why per-stock savings do not aggregate"),
+        P("On the ten-symbol portfolio, ADANIENT alone saved 17.5 points of drawdown and ITC 12.0 -- yet the portfolio drawdown improved by only 1.0 point."),
+        P("The reason is that stocks trough at different times. ADANIENT's worst moment was February 2023, the Hindenburg report. The portfolio's worst moment was March 2026, when ADANIENT was not the problem. Diversification had already absorbed most of what the model avoided."),
+        Callout("Arguably the most important result in the project", [
+          "The strategy is far better at protecting a CONCENTRATED position than a diversified one.",
+          "Avoiding one stock's crash barely moves a portfolio drawdown that is driven by everything falling together - and a broad, correlated decline is precisely what a portfolio-level drawdown is made of.",
+          "This reframes who the system is for. It is a single-stock risk tool that happens to aggregate weakly, not a portfolio hedge.",
+        ], "warn"),
+        Break(),
+      );
+
+      c.push(
+        H1("3. The charts"),
+        Bullet("figures/symbols/<SYMBOL>.png -- price with exits and re-entries, cash periods shaded, anomaly intensity, and drawdown against buy-and-hold. 96 charts."),
+        Bullet("figures/portfolio.png -- portfolio equity and drawdown, net of costs and tax."),
+        Bullet("figures/drawdown_scatter.png -- every symbol as one point, buy-and-hold drawdown against the strategy's."),
+        P("The shading on the per-stock chart carries more information than the markers. A triangle tells you a sell fired; the shaded band shows what the strategy was holding through, and that is where you can see whether an exit helped or simply missed a rebound."),
+
+        H2("3.1 A chart bug that only a human eye would catch"),
+        P("The scatter chart was titled \u201cbelow the line means the model helped\u201d. Both axes are negative, so a shallower drawdown -- minus 36% against minus 52% -- plots ABOVE the diagonal. The label was inverted."),
+        Callout("Why this one is worth recording", [
+          "It raised no error and produced no implausible number. The chart looked entirely reasonable while saying the opposite of the truth, and every summary statistic feeding it was correct.",
+          "It is the seventh defect in this project to produce quietly wrong output rather than a visible failure - and the first that no test could have caught, because the maths was right and only the label was wrong.",
+          "Some classes of error are only reachable by looking at the artefact.",
+        ], "warn"),
+        P("The same chart was also splitting points two ways, which lumped the 65 never-traded symbols in with the 6 genuinely worse ones under \u201cdeeper or equal\u201d. That presented inaction as failure. Points are now split three ways -- shallower, unchanged, deeper -- so the dominant fact about this strategy, that it does nothing for most symbols, is visible rather than disguised."),
+        Break(),
+      );
+
+      c.push(
+        H1("4. Known limitations"),
+        Num("The window contains no sharp market-wide crash. Every conclusion about magnitude is conditioned on that, and the 2020 stress test remains the only evidence of behaviour during one."),
+        Num("Drawdown is measured gross at the per-stock level. Costs and tax are applied at portfolio level in Phase 6; the per-symbol table would look marginally worse with them included."),
+        Num("Time-to-recover is unavailable for symbols still under water at the end of the window, which is most of them. Median figures are therefore computed over a biased subset and should be read as indicative."),
+        Num("The equal-weight portfolio has no position sizing. Top-N selection by signal strength exists but is not exercised, so the portfolio result does not reflect the concentration the signal could justify."),
+        Num("Charts are static images. Inspecting 96 of them is impractical in review, which is what Phase 10's dashboard is for."),
+
+        H1("5. Handoff to Phase 10"),
+        P("Phases 9 and 10 remain: the robustness experiment, and the HTML dashboard."),
+        P("The dashboard inherits everything needed -- per-symbol drawdown tables, per-scheme comparisons, the lead-time distribution, and the cost and tax breakdown. Its job is to make 96 charts navigable, which static files cannot be."),
+        P("One design note carried forward: the honest results in this project are mostly negative or narrow, and a dashboard makes it very easy to show only the flattering view. The per-symbol scatter and the untouched-symbol count should be prominent rather than buried, because they are what stop the headline mean from being read as a broad effect."),
       );
 
       return c;
