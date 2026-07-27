@@ -7,6 +7,12 @@ session.
 **Status:** phases 1–8 and 10 complete · 190 tests passing · phase 9 (robustness)
 not started.
 
+> **Which universe produced which number.** Results in this document come from
+> two different runs: the 96-symbol full universe (phases 6–8, severe-only
+> logic) and a 10-symbol run (after the two-tier change). Every table says
+> which. The artefacts currently in `reports/` are from the **10-symbol** run —
+> re-run `--all` before quoting full-universe figures.
+
 ---
 
 ## 1. What this is
@@ -233,7 +239,16 @@ the future, assert every earlier value is bit-identical.
 
 ## 9. Measured results
 
-### Retraining schemes (full universe, walk-forward, monthly)
+### Retraining schemes
+
+> ⚠️ **These numbers predate the two-tier signal logic (§3).** They were measured
+> on all 96 symbols with the severe-only rule, which fired on ~3× fewer days.
+> **The comparison needs re-running** — a ~13-minute job — before it is quoted
+> anywhere. The *conclusion* (schemes are indistinguishable) is expected to
+> hold, since it rests on the spread being smaller than run-to-run noise, but
+> the individual figures will move.
+
+*96 symbols, walk-forward, monthly refits, severe-only logic:*
 
 | scheme | CAGR | maxDD | vs B&H | trades/sym/yr |
 |---|---|---|---|---|
@@ -255,6 +270,8 @@ across four seeds, and the lowest variance. Its effective memory is 0.66 years,
 not 3.
 
 ### Costs and tax
+
+*96 symbols, severe-only logic — same caveat as above.*
 
 Cost drag **0.088% of capital per year** — a non-issue at this turnover.
 
